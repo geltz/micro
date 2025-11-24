@@ -7,7 +7,7 @@ middle/right mouse to pan on waveform.
 
 **buttons**
 - clear
-- export wav
+- export  
 
 **toggles**
 - click (impulses)
@@ -22,5 +22,6 @@ middle/right mouse to pan on waveform.
 - tone (filter)
 - crush
 - compress  
+
 
 
