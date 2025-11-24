@@ -11,7 +11,7 @@ from scipy import signal
 from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QUrl, QTimer, QRectF, QPointF,
                           QPropertyAnimation, QEasingCurve, QSize)
 from PyQt6.QtGui import (QColor, QPainter, QLinearGradient, QPen, QPainterPath, 
-                         QBrush, QFont, QPixmap, QCursor, QPolygonF, QRadialGradient)
+                         QBrush, QFont, QPixmap, QCursor, QPolygonF, QRadialGradient, QIcon)
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QSlider, QPushButton, 
                              QFileDialog, QFrame, QGraphicsDropShadowEffect,
@@ -34,15 +34,28 @@ class MicroEngine:
     @staticmethod
     def apply_reverb(x, sr, mix=0.3):
         if mix <= 0.01: return x
-        tail_len = int(sr * 0.4) 
+        # Create a longer tail for global smoothing
+        tail_len = int(sr * 1.5) 
         noise = np.random.randn(tail_len)
-        env = np.exp(-np.linspace(0, 1, tail_len) * 7.0)
+        env = np.exp(-np.linspace(0, 1, tail_len) * 6.0)
         ir = noise * env
         b, a = signal.butter(1, 0.4, 'low')
         ir = signal.lfilter(b, a, ir)
-        wet = signal.fftconvolve(x, ir, mode='full')[:len(x)]
+        
+        # Pad input to let reverb ring out
+        padding = np.zeros((tail_len, x.shape[1] if x.ndim > 1 else 1), dtype=np.float32)
+        if x.ndim == 1: x = x[:, None]
+        padded_x = np.concatenate([x, padding])
+        
+        wet = signal.fftconvolve(padded_x, ir[:, None] if ir.ndim==1 else ir, mode='full')
+        
+        # Trim to padded length
+        wet = wet[:len(padded_x)]
         wet = wet / (np.max(np.abs(wet)) + 1e-9)
-        return (1 - mix) * x + mix * wet
+        
+        # Mix (Result is longer than input x)
+        out = (1 - mix) * padded_x + mix * wet
+        return out
 
     @staticmethod
     def get_zero_crossing(data, target_idx, search_window=1024):
@@ -56,219 +69,213 @@ class MicroEngine:
         return start + min_local_idx
 
     @staticmethod
-    def process_grain(data, sr, region, params):
-        is_repeat = params.get('repeat', False)
+    def precompute_heavy_fx(data, sr, params):
+        """
+        Applies static/heavy effects (Tone, Crush, Comp) to the whole buffer (or window).
+        This allows fast cropping/slicing later.
+        """
+        chunk = data.copy()
         
-        # --- Helper: Cut audio at zero crossings ---
-        def make_one_cut(sub_region):
-            raw_start = int(sub_region[0] * len(data))
-            raw_end = int(sub_region[1] * len(data))
-            
-            start_idx = MicroEngine.get_zero_crossing(data, raw_start, 1024)
-            end_idx = MicroEngine.get_zero_crossing(data, raw_end, 1024)
-            
-            if start_idx >= end_idx: return np.zeros((1024, 2), dtype=np.float32), start_idx, start_idx
-            
-            chunk = data[start_idx:end_idx].copy()
-            if len(chunk) == 0: return np.zeros((1024, 2), dtype=np.float32), start_idx, start_idx
+        # 1. Bitcrush (Global)
+        crush = params.get('crush', 0.0)
+        if crush > 0.01:
+            factor = 1.0 - (crush * 0.98) 
+            target_len = int(len(chunk) * factor)
+            if target_len > 5:
+                down = signal.resample(chunk, target_len)
+                chunk = signal.resample(down, len(chunk))
 
-            return chunk, start_idx, end_idx
+        # 2. Tone (Filter)
+        tone = params.get('tone', 0.5)
+        if abs(tone - 0.5) > 0.05:
+            if tone < 0.5:
+                norm = tone * 2.0
+                cutoff = 100 * (180 ** norm)
+                sos = signal.butter(2, cutoff, 'low', fs=sr, output='sos')
+                chunk = signal.sosfilt(sos, chunk)
+            else:
+                norm = (tone - 0.5) * 2.0
+                cutoff = 20 + (8000 * (norm ** 2))
+                sos = signal.butter(2, cutoff, 'high', fs=sr, output='sos')
+                chunk = signal.sosfilt(sos, chunk)
 
-        # --- Helper: Apply Full FX Chain ---
-        def apply_fx(chunk):
-            # 1. Fades (smoother for overlap)
-            fade_len = min(int(sr * 0.05), len(chunk) // 2) 
+        # 3. Compressor
+        comp = params.get('compress', 0.0)
+        if comp > 0.01:
+            sos_env = signal.butter(1, 0.02, output='sos')
+            det_sig = np.abs(chunk)
+            env = signal.sosfilt(sos_env, det_sig)
+            thresh = 0.6 * (1.0 - comp * 0.7)
+            gain_red = np.minimum(1.0, thresh / (env + 1e-6))
+            chunk = chunk * gain_red * (1.0 + comp * 2.5)
+
+        return chunk
+
+    @staticmethod
+    def render_playback(source_data, sr, region, params):
+        """
+        Takes pre-processed data and handles Slicing, Rate, Envelope, Granular, Clicks, Reverb.
+        """
+        is_repeat = params.get('repeat', False)
+        grain_map = []
+        
+        # Helper: Render one slice (Rate, Rev, Env, Click)
+        def process_slice(sub_region):
+            raw_start = int(sub_region[0] * len(source_data))
+            raw_end = int(sub_region[1] * len(source_data))
+            
+            s_idx = MicroEngine.get_zero_crossing(source_data, raw_start, 1024)
+            e_idx = MicroEngine.get_zero_crossing(source_data, raw_end, 1024)
+            
+            if s_idx >= e_idx: return np.zeros((1024, 2), dtype=np.float32), s_idx, s_idx
+            
+            chunk = source_data[s_idx:e_idx].copy()
+            
+            # Fades
+            fade_len = min(int(sr * 0.05), len(chunk) // 2)
             if fade_len > 0:
-                fade_in = np.linspace(0, 1, fade_len)
-                fade_out = np.linspace(1, 0, fade_len)
-                if chunk.ndim > 1:
-                    fade_in = fade_in[:, None]
-                    fade_out = fade_out[:, None]
-                chunk[:fade_len] *= fade_in
-                chunk[-fade_len:] *= fade_out
+                fade = np.linspace(0, 1, fade_len)
+                chunk[:fade_len] *= fade
+                chunk[-fade_len:] *= fade[::-1]
 
-            # 2. Reverse
+            # Reverse
             if params.get('reverse', False): chunk = chunk[::-1]
 
-            # 3. Rate / Resample
+            # Rate
             rate = params.get('rate', 1.0)
             if abs(rate - 1.0) > 0.01:
                 new_len = int(len(chunk) / rate)
                 if new_len > 0: chunk = signal.resample(chunk, new_len)
 
-            # 4. Bitcrush
-            crush = params.get('crush', 0.0)
-            if crush > 0.01:
-                factor = 1.0 - (crush * 0.98) 
-                target_len = int(len(chunk) * factor)
-                if target_len > 5:
-                    down = signal.resample(chunk, target_len)
-                    chunk = signal.resample(down, len(chunk))
-
-            # 5. Tone (Filter)
-            tone = params.get('tone', 0.5)
-            if abs(tone - 0.5) > 0.05:
-                if tone < 0.5:
-                    norm = tone * 2.0
-                    cutoff = 100 * (180 ** norm)
-                    sos = signal.butter(2, cutoff, 'low', fs=sr, output='sos')
-                    chunk = signal.sosfilt(sos, chunk)
-                else:
-                    norm = (tone - 0.5) * 2.0
-                    cutoff = 20 + (8000 * (norm ** 2))
-                    sos = signal.butter(2, cutoff, 'high', fs=sr, output='sos')
-                    chunk = signal.sosfilt(sos, chunk)
-
-            # 6. Compressor
-            comp = params.get('compress', 0.0)
-            if comp > 0.01:
-                sos_env = signal.butter(1, 0.02, output='sos')
-                det_sig = np.mean(np.abs(chunk), axis=1) if chunk.ndim > 1 else np.abs(chunk)
-                env = signal.sosfilt(sos_env, det_sig)
-                thresh = 0.6 * (1.0 - comp * 0.7)
-                gain_red = np.minimum(1.0, thresh / (env + 1e-6))
-                if chunk.ndim > 1: gain_red = gain_red[:, None]
-                chunk = chunk * gain_red * (1.0 + comp * 2.5)
-
-            # 7. Envelope (Attack/Release)
+            # Envelope
             att_p = params.get('attack', 0.01)
             rel_p = params.get('release', 0.01)
-            n_samples = len(chunk)
-            att_s = int(n_samples * att_p)
-            rel_s = int(n_samples * rel_p)
-            if att_s + rel_s > n_samples:
-                scale = n_samples / (att_s + rel_s + 1)
-                att_s = int(att_s * scale)
-                rel_s = int(rel_s * scale)
-            env_shape = np.ones(n_samples, dtype=np.float32)
-            if att_s > 0: env_shape[:att_s] = np.sin(np.linspace(0, np.pi/2, att_s))
-            if rel_s > 0: env_shape[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
-            if chunk.ndim > 1: env_shape = env_shape[:, None]
-            chunk = chunk * env_shape * 0.7
+            n_s = len(chunk)
+            att_s = int(n_s * att_p)
+            rel_s = int(n_s * rel_p)
+            if att_s + rel_s > n_s:
+                scale = n_s / (att_s + rel_s + 1)
+                att_s, rel_s = int(att_s * scale), int(rel_s * scale)
             
-            # 8. Reverb
-            v_amt = params.get('verb', 0.0)
-            if v_amt > 0.01: chunk = MicroEngine.apply_reverb(chunk, sr, v_amt * 0.6)
-
-            # 9. Clicks/Glitch
+            env = np.ones(n_s, dtype=np.float32)
+            if att_s > 0: env[:att_s] = np.sin(np.linspace(0, np.pi/2, att_s))
+            if rel_s > 0: env[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
+            chunk *= env * 0.8
+            
+            # Audible Clicks (Noise Burst)
             if params.get('clicks', False):
-                c_len = min(len(chunk), 2000) 
-                if c_len > 100:
-                    raw_src = chunk if chunk.ndim == 1 else chunk[:, 0]
-                    raw = raw_src[100:c_len][::2]
-                    click_sig = np.diff(raw, prepend=0) 
-                    max_val = np.max(np.abs(click_sig))
-                    if max_val > 1e-5: click_sig = click_sig / max_val
-                    c_env = np.exp(-np.linspace(0, 15, len(click_sig)))
-                    click_sig = click_sig * c_env * 2.5 
-                    if chunk.ndim > 1: click_sig = np.column_stack((click_sig, click_sig))
-                    grid_step = int(sr * 0.25)
-                    for pos in range(0, len(chunk), grid_step):
-                        if random.random() < 0.35:
-                            remaining = len(chunk) - pos
-                            write_len = min(len(click_sig), remaining)
-                            if write_len > 0:
-                                segment = chunk[pos:pos+write_len] + click_sig[:write_len]
-                                chunk[pos:pos+write_len] = np.clip(segment, -1.0, 1.0)
+                # Generate glitches
+                grid = int(sr * 0.15)
+                for pos in range(0, len(chunk), grid):
+                    if random.random() < 0.3:
+                        click_len = random.randint(200, 800)
+                        if pos + click_len < len(chunk):
+                            noise = np.random.uniform(-0.5, 0.5, click_len).astype(np.float32)
+                            c_env = np.exp(-np.linspace(0, 5, click_len))
+                            burst = noise * c_env * 0.1 # subtle
+                            chunk[pos:pos+click_len] += burst
 
-            # 10. Stereo & Pan
+            # Stereo
             if chunk.ndim == 1: chunk = np.column_stack((chunk, chunk))
             
-            pan_depth = params.get('pan', 0.0)
-            if pan_depth > 0.01:
-                # "Symphonic" wide random pan
-                pos_rng = random.uniform(-1.0, 1.0)
-                width = pan_depth * 0.8 
-                l_gain = 1.0 - (width * (0.5 + 0.5 * pos_rng))
-                r_gain = 1.0 - (width * (0.5 + 0.5 * -pos_rng))
-                chunk[:, 0] *= l_gain
-                chunk[:, 1] *= r_gain
-            
-            return np.tanh(chunk)
+            # Pan
+            pan = params.get('pan', 0.0)
+            if pan > 0.01:
+                rng = random.uniform(-1, 1)
+                w = pan * 0.8
+                l = 1.0 - (w * (0.5 + 0.5 * rng))
+                r = 1.0 - (w * (0.5 + 0.5 * -rng))
+                chunk[:, 0] *= l
+                chunk[:, 1] *= r
 
-        grain_map = [] 
+            return np.tanh(chunk), s_idx, e_idx
+
+        # --- GENERATE SEQUENCE ---
+        final_buffer = None
         
         if not is_repeat:
             # Single Shot
-            chunk, s_idx, e_idx = make_one_cut(region)
-            if len(chunk) == 0: return np.zeros((1024, 2), dtype=np.float32), []
-            processed = apply_fx(chunk)
-            grain_map.append((0, (len(processed)/sr)*1000.0, region[0], region[1]))
-            return np.clip(processed, -0.99, 0.99), grain_map
+            chunk, s, e = process_slice(region)
+            final_buffer = chunk
+            grain_map.append((0, (len(chunk)/sr)*1000.0, region[0], region[1]))
         else:
-            # --- SYMPHONIC POLYPHONIC REPEAT ---
+            # Polyphonic Grain Loop
             bpm = random.randint(90, 120)
             beat_sec = 60.0 / bpm
-            step_16_sec = beat_sec / 4.0
+            total_slots = 32
+            seq_len = int(total_slots * (beat_sec/4.0) * sr)
+            seq_buffer = np.zeros((seq_len, 2), dtype=np.float32)
             
-            # 2 Bars
-            total_slots = 32 
-            seq_len_samples = int(total_slots * step_16_sec * sr)
-            seq_buffer = np.zeros((seq_len_samples, 2), dtype=np.float32)
-            
-            # HIGH DENSITY: 12 to 24 grains
             count = random.randint(12, 24)
-            active_slots = sorted([random.randint(0, total_slots-1) for _ in range(count)])
-            
+            slots = sorted([random.randint(0, total_slots-1) for _ in range(count)])
             reg_len = region[1] - region[0]
-            safe_padding = 0.001
-
-            for slot_idx in active_slots:
-                # Source
-                effective_len = max(0, reg_len - safe_padding)
-                r_offset = random.uniform(0, effective_len)
-                s_pt = region[0] + r_offset
-                
-                # Long duration for overlap
-                dur_factor = random.uniform(2.0, 8.0) 
-                
-                max_len_norm = region[1] - s_pt
-                desired_len_samples = int(step_16_sec * dur_factor * sr)
-                desired_len_norm = desired_len_samples / len(data)
-                actual_len_norm = min(desired_len_norm, max_len_norm)
-                e_pt = s_pt + actual_len_norm
-                
-                raw_chunk, s_idx, e_idx = make_one_cut((s_pt, e_pt))
-                if len(raw_chunk) == 0: continue
-                
-                grain = apply_fx(raw_chunk)
-                
-                # Mix
-                insert_idx = int(slot_idx * step_16_sec * sr)
-                write_len = min(len(grain), seq_len_samples - insert_idx)
-                
-                if write_len > 0:
-                    seq_buffer[insert_idx : insert_idx + write_len] += grain[:write_len]
-                    
-                    # Map
-                    p_start_ms = (insert_idx / sr) * 1000.0
-                    p_end_ms = ((insert_idx + write_len) / sr) * 1000.0
-                    src_s_norm = s_idx / len(data)
-                    src_e_norm = (s_idx + write_len) / len(data)
-                    
-                    if params.get('reverse', False):
-                        grain_map.append((p_start_ms, p_end_ms, src_e_norm, src_s_norm))
-                    else:
-                        grain_map.append((p_start_ms, p_end_ms, src_s_norm, src_e_norm))
-
-            # Soft Limiter
-            peak = np.max(np.abs(seq_buffer))
-            if peak > 0.9:
-                seq_buffer = seq_buffer * (0.9 / peak)
             
-            return seq_buffer, grain_map
+            for slot in slots:
+                offset = random.uniform(0, max(0, reg_len - 0.001))
+                s_pt = region[0] + offset
+                dur = random.uniform(2.0, 8.0) * (beat_sec/4.0)
+                len_norm = dur * sr / len(source_data)
+                e_pt = min(region[1], s_pt + len_norm)
+                
+                grain, s_idx, e_idx = process_slice((s_pt, e_pt))
+                if len(grain) == 0: continue
+                
+                ins_idx = int(slot * (beat_sec/4.0) * sr)
+                w_len = min(len(grain), seq_len - ins_idx)
+                if w_len > 0:
+                    seq_buffer[ins_idx:ins_idx+w_len] += grain[:w_len]
+                    
+                    p_s = (ins_idx/sr)*1000.0
+                    p_e = ((ins_idx+w_len)/sr)*1000.0
+                    n_s = s_idx/len(source_data)
+                    n_e = (s_idx+w_len)/len(source_data)
+                    grain_map.append((p_s, p_e, n_s, n_e))
+            
+            pk = np.max(np.abs(seq_buffer))
+            if pk > 0.9: seq_buffer *= (0.9/pk)
+            final_buffer = seq_buffer
+
+        # --- GLOBAL REVERB & PERSISTENCE ---
+        # Apply reverb to the *entire* buffer at the end so tails persist
+        # even after the loops/grains end.
+        v_amt = params.get('verb', 0.0)
+        if v_amt > 0.01:
+            final_buffer = MicroEngine.apply_reverb(final_buffer, sr, v_amt * 0.6)
+        
+        return np.clip(final_buffer, -0.99, 0.99), grain_map
 
 class ExportThread(QThread):
-    finished_ok = pyqtSignal(object, int, list)
-    def __init__(self, data, sr, region, params):
+    finished_ok = pyqtSignal(object, int, list, object) # Added extra obj for cache return
+    
+    def __init__(self, raw_data, sr, region, params, cached_source=None, cached_hash=None):
         super().__init__()
-        self.data, self.sr, self.region, self.params = data, sr, region, params
+        self.raw = raw_data
+        self.sr = sr
+        self.reg = region
+        self.params = params
+        self.cached = cached_source
+        self.in_hash = cached_hash
+
     def run(self):
         try:
-            processed, g_map = MicroEngine.process_grain(self.data, self.sr, self.region, self.params)
-            self.finished_ok.emit(processed, self.sr, g_map)
-        except Exception as e: 
-            print(e)
+            # 1. Prerender Check (Tone, Crush, Comp)
+            # If we have a cache and the hash matches, skip heavy DSP
+            dsp_source = self.cached
+            
+            # We assume caller manages hash check. If cached is None, we generate.
+            if dsp_source is None:
+                # OPTIMIZATION: If file is massive, maybe only process a window?
+                # For "Micro", let's assume < 5 mins and process all for safety/simplicity
+                dsp_source = MicroEngine.precompute_heavy_fx(self.raw, self.sr, self.params)
+            
+            # 2. Render Playback (Slicing, Rate, Grains, Reverb)
+            final, g_map = MicroEngine.render_playback(dsp_source, self.sr, self.reg, self.params)
+            
+            # Return final audio AND the dsp_source (to update cache)
+            self.finished_ok.emit(final, self.sr, g_map, dsp_source)
+            
+        except Exception as e:
+            print(f"Export Error: {e}")
 
 # --- UI COMPONENTS ---
 
@@ -845,6 +852,11 @@ class MainWindow(QMainWindow):
         self.resize(650, 520)
         self.setAcceptDrops(True)
         self.data, self.sr, self.p_data, self.tf = None, 44100, None, None
+        
+        # Caching Logic for Prerender
+        self.dsp_cache = None
+        self.dsp_hash = None # (tone, crush, comp)
+        
         self.grain_map = []
         self.c_reg = (0.3, 0.7)
         self.player = QMediaPlayer()
@@ -915,7 +927,10 @@ class MainWindow(QMainWindow):
 
     def set_reg(self, r): self.c_reg = r; self.auto_prev()
     def auto_prev(self): 
+        # If user is dragging selection, we want fast updates, so we don't block
+        # The logic is handled in prev() via caching
         if not self.wave.is_dragging: self.ptimer.start()
+        else: self.ptimer.start(10) # Fast debounce for drag
         
     def get_p(self):
         return {'attack': self.k_att.value(), 'release': self.k_rel.value(),
@@ -931,11 +946,29 @@ class MainWindow(QMainWindow):
     def prev(self):
         if self.data is None: return
         self.player.stop()
-        self.th = ExportThread(self.data, self.sr, self.c_reg, self.get_p())
+        
+        p = self.get_p()
+        
+        # Calculate Hash for "Heavy" FX (Tone, Crush, Comp)
+        # We exclude Rate/Reverse/Region as those are handled in render stage
+        current_hash = (p['tone'], p['crush'], p['compress'])
+        
+        cached_source = None
+        if self.dsp_cache is not None and self.dsp_hash == current_hash:
+            cached_source = self.dsp_cache
+            
+        self.th = ExportThread(self.data, self.sr, self.c_reg, p, cached_source, current_hash)
         self.th.finished_ok.connect(self.on_fin)
         self.th.start()
 
-    def on_fin(self, d, sr, g_map): 
+    def on_fin(self, d, sr, g_map, new_cache): 
+        # Update Cache
+        if new_cache is not None:
+            self.dsp_cache = new_cache
+            # Only update hash if we generated new cache
+            p = self.get_p()
+            self.dsp_hash = (p['tone'], p['crush'], p['compress'])
+
         self.p_data = d 
         self.grain_map = g_map
         self.wave.set_grain_map(g_map) # Pass map to visualizer
@@ -994,18 +1027,38 @@ class MainWindow(QMainWindow):
         self.wave.set_play_head(-1)
         self.atimer.stop()
         self.data, self.p_data = None, None
+        self.dsp_cache, self.dsp_hash = None, None
         self.wave.set_data(None)
         self.player.setSource(QUrl())
 
     def export(self):
         if self.p_data is None: return
+        
+        # 1. Define path: C:\Users\[You]\Music\micro
+        home_dir = os.path.expanduser("~")
+        save_dir = os.path.join(home_dir, "Music", "micro")
+        
+        # 2. Create folder if it doesn't exist
+        if not os.path.exists(save_dir):
+            try:
+                os.makedirs(save_dir)
+            except:
+                self.btn_ex.setText("err: cannot create folder")
+                return
+
+        # 3. Generate filename
         n = f"micro_export_{int(time.time())}.wav"
+        full_path = os.path.join(save_dir, n)
+
         try: 
-            MicroEngine.save_file(os.path.join(os.getcwd(), n), self.p_data, self.sr)
+            MicroEngine.save_file(full_path, self.p_data, self.sr)
             self.header.intensify()
-            self.btn_ex.setText(f"saved {n}")
+            
+            # 4. Feedback: Tell user where it went
+            self.btn_ex.setText("saved to Music/micro")
             QTimer.singleShot(2000, lambda: self.btn_ex.setText("export wav"))
-        except: pass
+        except: 
+            self.btn_ex.setText("error saving")
 
     def dragEnterEvent(self, e): e.accept() if e.mimeData().hasUrls() else e.ignore()
     def dropEvent(self, e): self.load_p(e.mimeData().urls()[0].toLocalFile())
@@ -1015,6 +1068,7 @@ class MainWindow(QMainWindow):
     def load_p(self, p):
         try:
             d, sr = MicroEngine.load_file(p); self.data, self.sr = d, sr
+            self.dsp_cache = None # Invalidates cache on new file
             self.wave.set_data(d); self.prev()
         except: pass
     def closeEvent(self, e):
@@ -1024,12 +1078,32 @@ class MainWindow(QMainWindow):
         e.accept()
 
 if __name__ == '__main__':
+    # 1. Fix Taskbar Icon for Windows (Wrapped in try/except to prevent crashes)
+    try:
+        import ctypes
+        myappid = 'micro.audio.tool.v1'
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass # Ignore if this fails (e.g. on non-Windows or permissions issues)
+
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLES)
+    
+    # 2. Set the Application Icon
+    # We resolve the absolute path to ensure the EXE finds the icon reliably
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "micro.ico")
+    
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+    elif os.path.exists("micro.ico"):
+        # Fallback for some dev environments
+        app.setWindowIcon(QIcon("micro.ico"))
+
     if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
         app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
     if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
         app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+        
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
