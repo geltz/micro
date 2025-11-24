@@ -162,17 +162,29 @@ class MicroEngine:
             if rel_s > 0: env[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
             chunk *= env * 0.8
             
-            # Audible Clicks (Noise Burst)
+            # Audible Clicks (Siney/Soft Glitches)
             if params.get('clicks', False):
                 # Generate glitches
                 grid = int(sr * 0.15)
                 for pos in range(0, len(chunk), grid):
                     if random.random() < 0.3:
-                        click_len = random.randint(200, 800)
+                        # Slightly longer length for a "tone" to be audible
+                        click_len = random.randint(400, 1200) 
+                        
                         if pos + click_len < len(chunk):
-                            noise = np.random.uniform(-0.5, 0.5, click_len).astype(np.float32)
-                            c_env = np.exp(-np.linspace(0, 5, click_len))
-                            burst = noise * c_env * 0.1 # subtle
+                            # 1. Generate a Sine Wave instead of Noise
+                            # Random freq between 300Hz (Low) and 1200Hz (High)
+                            freq = random.uniform(300, 1200)
+                            t = np.arange(click_len) / sr
+                            tone = np.sin(2 * np.pi * freq * t).astype(np.float32)
+                            
+                            # 2. Soft Envelope
+                            # We use a fast attack and exponential decay to make it "plucky" but soft
+                            c_env = np.exp(-np.linspace(0, 6, click_len))
+                            
+                            # 3. Mix (Lower volume for softness)
+                            burst = tone * c_env * 0.25
+                            
                             chunk[pos:pos+click_len] += burst
 
             # Stereo
