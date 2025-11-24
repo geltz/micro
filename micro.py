@@ -211,9 +211,18 @@ class MicroEngine:
             chunk_stereo[:, 0] *= l_gain
             chunk_stereo[:, 1] *= r_gain
 
-        # Safety Limiter
-        peak = np.max(np.abs(chunk_stereo))
-        if peak > 1.0: chunk_stereo = chunk_stereo / peak
+        # --- GLOBAL SOFT LIMITER ---
+        
+        # 1. Soft Saturation
+        # np.tanh (Hyperbolic Tangent) is linear at low volumes but curves 
+        # smoothly as it approaches +/- 1.0. This behaves like analog tape saturation:
+        # it prevents digital clipping by rounding off peaks instead of chopping them.
+        chunk_stereo = np.tanh(chunk_stereo)
+
+        # 2. Hard Safety Clamp
+        # Explicitly clip to 0.99 to leave a tiny bit of headroom for the DAC (Digital to Analog Converter)
+        # to prevent inter-sample peaks.
+        chunk_stereo = np.clip(chunk_stereo, -0.99, 0.99)
         
         return chunk_stereo
 
