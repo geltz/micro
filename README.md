@@ -4,9 +4,9 @@ it isolates regions of an audio sample and applies various effects.
 
 **buttons**
 - clear
-- click (short impulses)
+- click (impulses)
 - reverse
-- repeat (loop playback)
+- repeat
 - export wav
 
 **sliders**
@@ -17,3 +17,4 @@ it isolates regions of an audio sample and applies various effects.
 - tone (filter)
 - crush
 - compress  
+
