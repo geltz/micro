@@ -1005,12 +1005,10 @@ class MainWindow(QMainWindow):
         self.vol_anim.start()
 
         p = self.get_p()
-        
-        # --- UPDATE THIS LINE ---
+
         # Include self.c_reg (region) in the hash key. 
         # Changing region invalidates the cache because the slice changes.
         current_hash = (p['tone'], p['crush'], p['compress'], self.c_reg)
-        # ------------------------
         
         cached_source = None
         if self.dsp_cache is not None and self.dsp_hash == current_hash:
