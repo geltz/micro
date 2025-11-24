@@ -7,6 +7,7 @@ micro is a waveform-centered sound engine and effects processor with a qt6 inter
 it isolates regions of an audio sample and applies various effects.	
 
 **controls**
+
 left mouse for region selection.    
 middle/right mouse to pan on waveform.  
 
@@ -27,5 +28,6 @@ middle/right mouse to pan on waveform.
 - tone (filter)
 - crush
 - compress  
+
 
 
