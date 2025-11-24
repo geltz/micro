@@ -35,7 +35,6 @@ class MicroEngine:
     @staticmethod
     def apply_reverb(x, sr, mix=0.3):
         if mix <= 0.01: return x
-        # Create a longer tail for global smoothing
         tail_len = int(sr * 1.5) 
         noise = np.random.randn(tail_len)
         env = np.exp(-np.linspace(0, 1, tail_len) * 6.0)
@@ -43,18 +42,15 @@ class MicroEngine:
         b, a = signal.butter(1, 0.4, 'low')
         ir = signal.lfilter(b, a, ir)
         
-        # Pad input to let reverb ring out
         padding = np.zeros((tail_len, x.shape[1] if x.ndim > 1 else 1), dtype=np.float32)
         if x.ndim == 1: x = x[:, None]
         padded_x = np.concatenate([x, padding])
         
         wet = signal.fftconvolve(padded_x, ir[:, None] if ir.ndim==1 else ir, mode='full')
         
-        # Trim to padded length
         wet = wet[:len(padded_x)]
         wet = wet / (np.max(np.abs(wet)) + 1e-9)
         
-        # Mix (Result is longer than input x)
         out = (1 - mix) * padded_x + mix * wet
         return out
 
@@ -71,13 +67,8 @@ class MicroEngine:
 
     @staticmethod
     def precompute_heavy_fx(data, sr, params):
-        """
-        Applies static/heavy effects (Tone, Crush, Comp) to the whole buffer (or window).
-        This allows fast cropping/slicing later.
-        """
         chunk = data.copy()
         
-        # 1. Bitcrush (Global)
         crush = params.get('crush', 0.0)
         if crush > 0.01:
             factor = 1.0 - (crush * 0.98) 
@@ -86,7 +77,6 @@ class MicroEngine:
                 down = signal.resample(chunk, target_len)
                 chunk = signal.resample(down, len(chunk))
 
-        # 2. Tone (Filter)
         tone = params.get('tone', 0.5)
         if abs(tone - 0.5) > 0.05:
             if tone < 0.5:
@@ -100,7 +90,6 @@ class MicroEngine:
                 sos = signal.butter(2, cutoff, 'high', fs=sr, output='sos')
                 chunk = signal.sosfilt(sos, chunk)
 
-        # 3. Compressor
         comp = params.get('compress', 0.0)
         if comp > 0.01:
             sos_env = signal.butter(1, 0.02, output='sos')
@@ -113,14 +102,10 @@ class MicroEngine:
         return chunk
 
     @staticmethod
-    def render_playback(source_data, sr, region, params):
-        """
-        Takes pre-processed data and handles Slicing, Rate, Envelope, Granular, Clicks, Reverb.
-        """
+    def render_playback(source_data, sr, region, params, abort_check=None): # <--- Add arg
         is_repeat = params.get('repeat', False)
         grain_map = []
         
-        # Helper: Render one slice (Rate, Rev, Env, Click)
         def process_slice(sub_region):
             raw_start = int(sub_region[0] * len(source_data))
             raw_end = int(sub_region[1] * len(source_data))
@@ -132,23 +117,19 @@ class MicroEngine:
             
             chunk = source_data[s_idx:e_idx].copy()
             
-            # Fades
             fade_len = min(int(sr * 0.05), len(chunk) // 2)
             if fade_len > 0:
                 fade = np.linspace(0, 1, fade_len)
                 chunk[:fade_len] *= fade
                 chunk[-fade_len:] *= fade[::-1]
 
-            # Reverse
             if params.get('reverse', False): chunk = chunk[::-1]
 
-            # Rate
             rate = params.get('rate', 1.0)
             if abs(rate - 1.0) > 0.01:
                 new_len = int(len(chunk) / rate)
                 if new_len > 0: chunk = signal.resample(chunk, new_len)
 
-            # Envelope
             att_p = params.get('attack', 0.01)
             rel_p = params.get('release', 0.01)
             n_s = len(chunk)
@@ -163,35 +144,21 @@ class MicroEngine:
             if rel_s > 0: env[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
             chunk *= env * 0.8
             
-            # Audible Clicks (Siney/Soft Glitches)
             if params.get('clicks', False):
-                # Generate glitches
                 grid = int(sr * 0.15)
                 for pos in range(0, len(chunk), grid):
                     if random.random() < 0.3:
-                        # Slightly longer length for a "tone" to be audible
                         click_len = random.randint(400, 1200) 
-                        
                         if pos + click_len < len(chunk):
-                            # 1. Generate a Sine Wave instead of Noise
-                            # Random freq between 300Hz (Low) and 1200Hz (High)
                             freq = random.uniform(300, 1200)
                             t = np.arange(click_len) / sr
                             tone = np.sin(2 * np.pi * freq * t).astype(np.float32)
-                            
-                            # 2. Soft Envelope
-                            # We use a fast attack and exponential decay to make it "plucky" but soft
                             c_env = np.exp(-np.linspace(0, 6, click_len))
-                            
-                            # 3. Mix (Lower volume for softness)
                             burst = tone * c_env * 0.25
-                            
                             chunk[pos:pos+click_len] += burst
 
-            # Stereo
             if chunk.ndim == 1: chunk = np.column_stack((chunk, chunk))
             
-            # Pan
             pan = params.get('pan', 0.0)
             if pan > 0.01:
                 rng = random.uniform(-1, 1)
@@ -203,16 +170,14 @@ class MicroEngine:
 
             return np.tanh(chunk), s_idx, e_idx
 
-        # --- GENERATE SEQUENCE ---
         final_buffer = None
         
         if not is_repeat:
-            # Single Shot
+            if abort_check and abort_check(): return None, [] # <--- Check here
             chunk, s, e = process_slice(region)
             final_buffer = chunk
             grain_map.append((0, (len(chunk)/sr)*1000.0, region[0], region[1]))
         else:
-            # Polyphonic Grain Loop
             bpm = random.randint(90, 120)
             beat_sec = 60.0 / bpm
             total_slots = 32
@@ -224,6 +189,7 @@ class MicroEngine:
             reg_len = region[1] - region[0]
             
             for slot in slots:
+                if abort_check and abort_check(): return None, [] # <--- Check inside loop
                 offset = random.uniform(0, max(0, reg_len - 0.001))
                 s_pt = region[0] + offset
                 dur = random.uniform(2.0, 8.0) * (beat_sec/4.0)
@@ -248,17 +214,16 @@ class MicroEngine:
             if pk > 0.9: seq_buffer *= (0.9/pk)
             final_buffer = seq_buffer
 
-        # --- GLOBAL REVERB & PERSISTENCE ---
-        # Apply reverb to the *entire* buffer at the end so tails persist
-        # even after the loops/grains end.
+        # Reverb is the most expensive operation.
         v_amt = params.get('verb', 0.0)
         if v_amt > 0.01:
+            if abort_check and abort_check(): return None, [] # <--- Check before reverb
             final_buffer = MicroEngine.apply_reverb(final_buffer, sr, v_amt * 0.6)
         
         return np.clip(final_buffer, -0.99, 0.99), grain_map
 
 class ExportThread(QThread):
-    finished_ok = pyqtSignal(object, int, list, object) # Added extra obj for cache return
+    finished_ok = pyqtSignal(object, int, list, object) 
     
     def __init__(self, raw_data, sr, region, params, cached_source=None, cached_hash=None):
         super().__init__()
@@ -268,27 +233,83 @@ class ExportThread(QThread):
         self.params = params
         self.cached = cached_source
         self.in_hash = cached_hash
+        self._is_aborted = False  # Flag to stop processing
+
+    def abort(self):
+        """Signals the thread to stop calculation immediately."""
+        self._is_aborted = True
 
     def run(self):
         try:
-            # 1. Prerender Check (Tone, Crush, Comp)
-            # If we have a cache and the hash matches, skip heavy DSP
+            if self._is_aborted: return
+
+            # Instead of processing the whole song, we only process the loop + padding.
+            
+            total_len = len(self.raw)
+            r_start, r_end = self.reg # Current region (0.0 to 1.0)
+            
+            # Add 250ms padding to let filters/reverb settle naturally
+            pad_samples = int(self.sr * 0.25)
+            
+            # Calculate integer indices for the slice
+            idx_start = max(0, int(r_start * total_len) - pad_samples)
+            idx_end = min(total_len, int(r_end * total_len) + pad_samples)
+            
+            # Create the small work buffer
+            sliced_raw = self.raw[idx_start:idx_end]
+            if len(sliced_raw) == 0: return
+
+            # We must translate the User's Region (0-1 relative to Song)
+            # into a Relative Region (0-1 relative to this specific Slice)
+            # so the engine knows where the "active" part of the slice is.
+            
+            # Start index of selection relative to the slice start
+            loc_s = int(r_start * total_len) - idx_start
+            loc_e = int(r_end * total_len) - idx_start
+            
+            # Normalize to the slice length
+            rel_reg = (loc_s / len(sliced_raw), loc_e / len(sliced_raw))
+
             dsp_source = self.cached
             
-            # We assume caller manages hash check. If cached is None, we generate.
             if dsp_source is None:
-                # OPTIMIZATION: If file is massive, maybe only process a window?
-                # For "Micro", let's assume < 5 mins and process all for safety/simplicity
-                dsp_source = MicroEngine.precompute_heavy_fx(self.raw, self.sr, self.params)
+                if self._is_aborted: return 
+                # Process only the small slice! (Fast)
+                dsp_source = MicroEngine.precompute_heavy_fx(sliced_raw, self.sr, self.params)
+
+            if self._is_aborted: return
+
+            # Render playback using the small slice and relative region
+            # (Pass lambda to allow aborting mid-render)
+            final, g_map = MicroEngine.render_playback(
+                dsp_source, self.sr, rel_reg, self.params, 
+                abort_check=lambda: self._is_aborted
+            )
+
+            if self._is_aborted or final is None: return
+
+            # The engine returned grain positions relative to the SLICE.
+            # We must convert them back to Global coordinates so the UI draws them correctly.
             
-            # 2. Render Playback (Slicing, Rate, Grains, Reverb)
-            final, g_map = MicroEngine.render_playback(dsp_source, self.sr, self.reg, self.params)
+            fixed_map = []
+            slice_len = len(sliced_raw)
             
-            # Return final audio AND the dsp_source (to update cache)
-            self.finished_ok.emit(final, self.sr, g_map, dsp_source)
+            for (ps, pe, ns, ne) in g_map:
+                # ns, ne are 0-1 relative to slice
+                # Convert to absolute sample index -> normalize to total song length
+                abs_s = ns * slice_len + idx_start
+                abs_e = ne * slice_len + idx_start
+                
+                global_ns = abs_s / total_len
+                global_ne = abs_e / total_len
+                
+                fixed_map.append((ps, pe, global_ns, global_ne))
+
+            self.finished_ok.emit(final, self.sr, fixed_map, dsp_source)
             
         except Exception as e:
-            print(f"Export Error: {e}")
+            if not self._is_aborted:
+                print(f"Export Error: {e}")
 
 # --- UI COMPONENTS ---
 
@@ -553,7 +574,6 @@ class ZoomWaveEditor(QWidget):
         self.hue_anim = 0.0
         self.cached_px = None
         
-        # Granular State
         self.grain_map = [] 
         self.current_loop_ms = -1.0
 
@@ -608,7 +628,6 @@ class ZoomWaveEditor(QWidget):
         e_px = (end - self.view_offset) / vw * w
         tol = 10 
         
-        # Pan Check
         if e.button() == Qt.MouseButton.RightButton or e.button() == Qt.MouseButton.MiddleButton:
             self.drag_mode = 'pan'
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -767,7 +786,6 @@ class ZoomWaveEditor(QWidget):
         ex = (e - self.view_offset) / vw * w
         sel_w = ex - sx
 
-        # Draw Selection
         if sel_w > 1:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(63, 108, 155, 10))
@@ -781,44 +799,34 @@ class ZoomWaveEditor(QWidget):
             painter.fillRect(QRectF(sx, 0, 3, h), brush)
             painter.fillRect(QRectF(ex-3, 0, 3, h), brush)
 
-        # --- MULTI-HEAD VISUALIZATION (Taller & Subtle) ---
         if self.grain_map and self.current_loop_ms >= 0:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             
             for (p_start, p_end, src_start, src_end) in self.grain_map:
                 if p_start <= self.current_loop_ms < p_end:
                     
-                    # Progress 0.0 -> 1.0
                     progress = (self.current_loop_ms - p_start) / (p_end - p_start)
-                    
-                    # Current Source Position
                     cur_src = src_start + (src_end - src_start) * progress
                     gx = (cur_src - self.view_offset) / vw * w
                     
                     if 0 <= gx <= w:
-                        # Subtle Pastel Color (Low Alpha)
                         hue = (cur_src * 5.0 + self.hue_anim) % 1.0
-                        # Alpha 0.35 (88/255) for overlapping subtlety
                         col = QColor.fromHslF(hue, 0.6, 0.75, 0.35) 
                         
                         painter.setBrush(col)
-                        # Very faint stroke
                         painter.setPen(QPen(QColor(255, 255, 255, 100), 0.5))
                         
-                        # Tall Triangle Geometry
-                        # Base anchored at bottom (h)
                         tri_h = 55  
-                        tri_w = 8   # Thinner (was 16)
-                        y_base = h  # Pixel-aligned bottom
+                        tri_w = 8   
+                        y_base = h  
                         
                         tri = QPolygonF([
-                            QPointF(gx, y_base - tri_h),      # Tip (Up)
-                            QPointF(gx - tri_w/2, y_base),    # Bottom Left
-                            QPointF(gx + tri_w/2, y_base)     # Bottom Right
+                            QPointF(gx, y_base - tri_h),
+                            QPointF(gx - tri_w/2, y_base),
+                            QPointF(gx + tri_w/2, y_base)
                         ])
                         painter.drawPolygon(tri)
 
-        # --- Standard Playhead (Fallback) ---
         if self.play_head >= 0 and not self.grain_map:
             ph_abs = s + self.play_head * (e - s)
             px = (ph_abs - self.view_offset) / vw * w
@@ -862,17 +870,37 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("micro")
+        self.worker_thread = None      # The currently running thread
+        self.update_pending = False    # Do we need to recalc after current finishes?
+        self.old_threads = []          # Garbage collection "waiting room"
         self.resize(650, 520)
         self.setAcceptDrops(True)
         self.data, self.sr, self.p_data, self.tf = None, 44100, None, None
+        # Thread Locking State
+        self.is_processing = False
+        self.update_pending = False
         
-        # Caching Logic for Prerender
         self.dsp_cache = None
-        self.dsp_hash = None # (tone, crush, comp)
+        self.dsp_hash = None 
+
+        self.dsp_cache = None
+        self.dsp_hash = None 
         
         self.grain_map = []
         self.c_reg = (0.3, 0.7)
         self.player = QMediaPlayer()
+        
+        self.ao = QAudioOutput()
+        self.player.setAudioOutput(self.ao)
+        self.player.mediaStatusChanged.connect(self.media_status)
+        
+        # --- New fader animation ---
+        self.vol_anim = QPropertyAnimation(self.ao, b"volume")
+        self.vol_anim.setDuration(250) # 250ms fade out
+        self.vol_anim.setEndValue(0.0)
+        self.vol_anim.setEasingCurve(QEasingCurve.Type.Linear)
+        # ---------------------------   
+       
         self.last_media_pos = 0
         self.last_update_time = 0
         self.ao = QAudioOutput()
@@ -939,11 +967,9 @@ class MainWindow(QMainWindow):
         self.atimer = QTimer(interval=16, timeout=self.tick)
 
     def set_reg(self, r): self.c_reg = r; self.auto_prev()
-    def auto_prev(self): 
-        # If user is dragging selection, we want fast updates, so we don't block
-        # The logic is handled in prev() via caching
-        if not self.wave.is_dragging: self.ptimer.start()
-        else: self.ptimer.start(10) # Fast debounce for drag
+    
+    def auto_prev(self):
+        self.ptimer.start(120)
         
     def get_p(self):
         return {'attack': self.k_att.value(), 'release': self.k_rel.value(),
@@ -957,43 +983,112 @@ class MainWindow(QMainWindow):
                 'repeat': self.t_rep.checked}
 
     def prev(self):
+        # If we are already running, don't stack another thread on top.
+        # Instead, signal that we need to run again as soon as this one is done.
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self.update_pending = True
+            self.worker_thread.abort()  # Ask it to stop early
+            return
+
+        # If we are free, start processing immediately
+        self.start_processing()
+
+    def start_processing(self):
         if self.data is None: return
-        self.player.stop()
-        
+
+        self.is_processing = True 
+        self.update_pending = False 
+
+        self.vol_anim.stop()
+        self.vol_anim.setStartValue(self.ao.volume())
+        self.vol_anim.setEndValue(0.0)
+        self.vol_anim.start()
+
         p = self.get_p()
         
-        # Calculate Hash for "Heavy" FX (Tone, Crush, Comp)
-        # We exclude Rate/Reverse/Region as those are handled in render stage
-        current_hash = (p['tone'], p['crush'], p['compress'])
+        # --- UPDATE THIS LINE ---
+        # Include self.c_reg (region) in the hash key. 
+        # Changing region invalidates the cache because the slice changes.
+        current_hash = (p['tone'], p['crush'], p['compress'], self.c_reg)
+        # ------------------------
         
         cached_source = None
         if self.dsp_cache is not None and self.dsp_hash == current_hash:
             cached_source = self.dsp_cache
             
-        self.th = ExportThread(self.data, self.sr, self.c_reg, p, cached_source, current_hash)
-        self.th.finished_ok.connect(self.on_fin)
-        self.th.start()
+        self.worker_thread = ExportThread(self.data, self.sr, self.c_reg, p, cached_source, current_hash)
+        self.worker_thread.finished_ok.connect(self.on_fin)
+        self.worker_thread.finished.connect(self.on_thread_finished)
+        self.worker_thread.start()
+    
+    def on_thread_finished(self):
+        # 1. Clean up the reference to the finished thread
+        sender = self.sender()
+        
+        # Move to trash list to prevent "QThread destroyed while running" crash
+        # (It keeps the Python object alive until C++ is truly done)
+        if sender not in self.old_threads:
+            self.old_threads.append(sender)
+        
+        # If this was our primary worker, clear the slot
+        if sender == self.worker_thread:
+            self.worker_thread = None
 
-    def on_fin(self, d, sr, g_map, new_cache): 
-        # Update Cache
+        # 2. Check if the user changed settings while we were working
+        if self.update_pending:
+            # Recursion: Start the next calculation immediately
+            # This ensures the UI always eventually shows the latest state
+            self.start_processing()
+        else:
+            # We are truly done. 
+            self.is_processing = False
+            
+            # Clean up the trash list now that things are calm
+            self.old_threads.clear()
+    
+    def cleanup_old_thread(self):
+        # The sender is the thread that just finished
+        sender = self.sender()
+        if sender in self.old_threads:
+            self.old_threads.remove(sender)
+            # Now that it is removed from the list AND execution has finished, 
+            # Python can safely Garbage Collect it.
+
+    def on_fin(self, d, sr, g_map, new_cache):
+
+        self.is_processing = False
+
         if new_cache is not None:
             self.dsp_cache = new_cache
-            # Only update hash if we generated new cache
             p = self.get_p()
             self.dsp_hash = (p['tone'], p['crush'], p['compress'])
 
         self.p_data = d 
         self.grain_map = g_map
-        self.wave.set_grain_map(g_map) # Pass map to visualizer
+        self.wave.set_grain_map(g_map) 
+        
         try:
             fd, p = tempfile.mkstemp(suffix=".wav"); os.close(fd)
             MicroEngine.save_file(p, d, sr)
-            self.tf = p
+            
+            # Unload previous file to release lock
             self.player.stop()
+            self.player.setSource(QUrl()) 
+            
+            if self.tf and os.path.exists(self.tf):
+                try: os.remove(self.tf)
+                except: pass
+            self.tf = p
+            
+            # Restore volume and play
+            self.vol_anim.stop()
+            self.ao.setVolume(1.0) # Force volume back to 100%
+            
             self.player.setSource(QUrl.fromLocalFile(p))
             self.player.play()
             self.atimer.start()
-        except: pass
+        except Exception as e: 
+            print(f"Playback Error: {e}")
 
     def tick(self):
         if self.p_data is None or len(self.p_data) == 0: return
@@ -1014,11 +1109,8 @@ class MainWindow(QMainWindow):
             total_dur_ms = (len(self.p_data) / self.sr) * 1000.0
             if total_dur_ms > 0:
                 current_loop_ms = est_pos % total_dur_ms
-                
-                # 1. Feed exact loop time to visualizer
                 self.wave.set_playback_pos(current_loop_ms)
                 
-                # 2. Handle Playhead fallback
                 if self.t_rep.checked:
                     self.wave.set_play_head(-1) 
                 else:
@@ -1046,28 +1138,21 @@ class MainWindow(QMainWindow):
 
     def export(self):
         if self.p_data is None: return
-        
-        # 1. Define path: C:\Users\[You]\Music\micro
         home_dir = os.path.expanduser("~")
         save_dir = os.path.join(home_dir, "Music", "micro")
         
-        # 2. Create folder if it doesn't exist
         if not os.path.exists(save_dir):
-            try:
-                os.makedirs(save_dir)
+            try: os.makedirs(save_dir)
             except:
                 self.btn_ex.setText("err: cannot create folder")
                 return
 
-        # 3. Generate filename
         n = f"micro_export_{int(time.time())}.wav"
         full_path = os.path.join(save_dir, n)
 
         try: 
             MicroEngine.save_file(full_path, self.p_data, self.sr)
             self.header.intensify()
-            
-            # 4. Feedback: Tell user where it went
             self.btn_ex.setText("saved to Music/micro")
             QTimer.singleShot(2000, lambda: self.btn_ex.setText("export wav"))
         except: 
@@ -1081,7 +1166,7 @@ class MainWindow(QMainWindow):
     def load_p(self, p):
         try:
             d, sr = MicroEngine.load_file(p); self.data, self.sr = d, sr
-            self.dsp_cache = None # Invalidates cache on new file
+            self.dsp_cache = None 
             self.wave.set_data(d); self.prev()
         except: pass
     def closeEvent(self, e):
@@ -1091,25 +1176,19 @@ class MainWindow(QMainWindow):
         e.accept()
 
 if __name__ == '__main__':
-    # 1. Fix Taskbar Icon for Windows (Wrapped in try/except to prevent crashes)
     try:
         import ctypes
         myappid = 'micro.audio.tool.v1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-    except Exception:
-        pass # Ignore if this fails (e.g. on non-Windows or permissions issues)
+    except Exception: pass
 
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLES)
     
-    # 2. Set the Application Icon
-    # We resolve the absolute path to ensure the EXE finds the icon reliably
     icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "micro.ico")
-    
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
     elif os.path.exists("micro.ico"):
-        # Fallback for some dev environments
         app.setWindowIcon(QIcon("micro.ico"))
 
     if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
