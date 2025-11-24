@@ -16,7 +16,7 @@ middle/right mouse to pan on waveform.
 - export  
 
 **toggles**
-- click (impulses)
+- click    
 - reverse
 - grain  
 
@@ -25,9 +25,10 @@ middle/right mouse to pan on waveform.
 - pan
 - reverb
 - playback rate
-- tone (filter)
+- tone    
 - crush
 - compress  
+
 
 
 
