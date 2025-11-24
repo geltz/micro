@@ -1,5 +1,5 @@
 <p>
-  <img src="micro.png" alt="micro icon" width="100">
+  <img src="icon.png" alt="micro icon" width="100">
 </p>
 
 micro is a granular sound engine with a qt6 interface.	
@@ -28,6 +28,7 @@ middle/right mouse to pan on waveform.
 - tone    
 - crush
 - compress  
+
 
 
 
