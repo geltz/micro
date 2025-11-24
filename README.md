@@ -1,4 +1,4 @@
-micro is a waveform-centered sound engine and effects processor with a pyqt6 interface.	
+micro is a waveform-centered sound engine and effects processor with a qt6 interface.	
 
 it isolates regions of an audio sample and applies various effects.	
 
@@ -22,6 +22,7 @@ middle/right mouse to pan on waveform.
 - tone (filter)
 - crush
 - compress  
+
 
 
 
