@@ -2,12 +2,17 @@ micro is a waveform-centered sound engine and effects processor with a pyqt6 int
 
 it isolates regions of an audio sample and applies various effects.	
 
+left mouse: region selection.    
+middle/right mouse: pan on waveform.  
+
 **buttons**
 - clear
+- export wav
+
+**toggles**
 - click (impulses)
 - reverse
-- repeat
-- export wav
+- grain  
 
 **sliders**
 - attack / release
