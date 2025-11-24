@@ -647,11 +647,9 @@ class ZoomWaveEditor(QWidget):
         sel_w = ex - sx
 
         if sel_w > 1:
-            # Selection Rect
+            # Light selection rectangle overlay
             painter.setPen(Qt.PenStyle.NoPen)
-            # Use a dark transparent overlay to "dim" the selected area or highlight it
-            # This avoids re-drawing the complex path
-            painter.setBrush(QColor(63, 108, 155, 40)) 
+            painter.setBrush(QColor(63, 108, 155, 15))
             painter.drawRect(QRectF(sx, 0, sel_w, h))
 
             # Handles
