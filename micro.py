@@ -74,9 +74,9 @@ class MicroEngine:
 
             return chunk, start_idx, end_idx
 
-        # --- Helper: Apply FX Chain ---
+        # --- Helper: Apply Full FX Chain ---
         def apply_fx(chunk):
-            # 1. Fade Edges (Longer fades for smoother overlaps)
+            # 1. Fades (smoother for overlap)
             fade_len = min(int(sr * 0.05), len(chunk) // 2) 
             if fade_len > 0:
                 fade_in = np.linspace(0, 1, fade_len)
@@ -96,17 +96,89 @@ class MicroEngine:
                 new_len = int(len(chunk) / rate)
                 if new_len > 0: chunk = signal.resample(chunk, new_len)
 
-            # [Standard FX chain - Crush, Tone, Comp, Verb etc. omitted for brevity, 
-            #  assume identical to previous version, insert here if needed or keep existing helper logic]
+            # 4. Bitcrush
+            crush = params.get('crush', 0.0)
+            if crush > 0.01:
+                factor = 1.0 - (crush * 0.98) 
+                target_len = int(len(chunk) * factor)
+                if target_len > 5:
+                    down = signal.resample(chunk, target_len)
+                    chunk = signal.resample(down, len(chunk))
+
+            # 5. Tone (Filter)
+            tone = params.get('tone', 0.5)
+            if abs(tone - 0.5) > 0.05:
+                if tone < 0.5:
+                    norm = tone * 2.0
+                    cutoff = 100 * (180 ** norm)
+                    sos = signal.butter(2, cutoff, 'low', fs=sr, output='sos')
+                    chunk = signal.sosfilt(sos, chunk)
+                else:
+                    norm = (tone - 0.5) * 2.0
+                    cutoff = 20 + (8000 * (norm ** 2))
+                    sos = signal.butter(2, cutoff, 'high', fs=sr, output='sos')
+                    chunk = signal.sosfilt(sos, chunk)
+
+            # 6. Compressor
+            comp = params.get('compress', 0.0)
+            if comp > 0.01:
+                sos_env = signal.butter(1, 0.02, output='sos')
+                det_sig = np.mean(np.abs(chunk), axis=1) if chunk.ndim > 1 else np.abs(chunk)
+                env = signal.sosfilt(sos_env, det_sig)
+                thresh = 0.6 * (1.0 - comp * 0.7)
+                gain_red = np.minimum(1.0, thresh / (env + 1e-6))
+                if chunk.ndim > 1: gain_red = gain_red[:, None]
+                chunk = chunk * gain_red * (1.0 + comp * 2.5)
+
+            # 7. Envelope (Attack/Release)
+            att_p = params.get('attack', 0.01)
+            rel_p = params.get('release', 0.01)
+            n_samples = len(chunk)
+            att_s = int(n_samples * att_p)
+            rel_s = int(n_samples * rel_p)
+            if att_s + rel_s > n_samples:
+                scale = n_samples / (att_s + rel_s + 1)
+                att_s = int(att_s * scale)
+                rel_s = int(rel_s * scale)
+            env_shape = np.ones(n_samples, dtype=np.float32)
+            if att_s > 0: env_shape[:att_s] = np.sin(np.linspace(0, np.pi/2, att_s))
+            if rel_s > 0: env_shape[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
+            if chunk.ndim > 1: env_shape = env_shape[:, None]
+            chunk = chunk * env_shape * 0.7
             
-            # Ensure Stereo
+            # 8. Reverb
+            v_amt = params.get('verb', 0.0)
+            if v_amt > 0.01: chunk = MicroEngine.apply_reverb(chunk, sr, v_amt * 0.6)
+
+            # 9. Clicks/Glitch
+            if params.get('clicks', False):
+                c_len = min(len(chunk), 2000) 
+                if c_len > 100:
+                    raw_src = chunk if chunk.ndim == 1 else chunk[:, 0]
+                    raw = raw_src[100:c_len][::2]
+                    click_sig = np.diff(raw, prepend=0) 
+                    max_val = np.max(np.abs(click_sig))
+                    if max_val > 1e-5: click_sig = click_sig / max_val
+                    c_env = np.exp(-np.linspace(0, 15, len(click_sig)))
+                    click_sig = click_sig * c_env * 2.5 
+                    if chunk.ndim > 1: click_sig = np.column_stack((click_sig, click_sig))
+                    grid_step = int(sr * 0.25)
+                    for pos in range(0, len(chunk), grid_step):
+                        if random.random() < 0.35:
+                            remaining = len(chunk) - pos
+                            write_len = min(len(click_sig), remaining)
+                            if write_len > 0:
+                                segment = chunk[pos:pos+write_len] + click_sig[:write_len]
+                                chunk[pos:pos+write_len] = np.clip(segment, -1.0, 1.0)
+
+            # 10. Stereo & Pan
             if chunk.ndim == 1: chunk = np.column_stack((chunk, chunk))
             
-            # Pan (Randomized per grain for width)
             pan_depth = params.get('pan', 0.0)
             if pan_depth > 0.01:
+                # "Symphonic" wide random pan
                 pos_rng = random.uniform(-1.0, 1.0)
-                width = pan_depth * 0.8 # Wider spread for symphony
+                width = pan_depth * 0.8 
                 l_gain = 1.0 - (width * (0.5 + 0.5 * pos_rng))
                 r_gain = 1.0 - (width * (0.5 + 0.5 * -pos_rng))
                 chunk[:, 0] *= l_gain
@@ -134,10 +206,8 @@ class MicroEngine:
             seq_len_samples = int(total_slots * step_16_sec * sr)
             seq_buffer = np.zeros((seq_len_samples, 2), dtype=np.float32)
             
-            # HIGH DENSITY: 12 to 24 grains playing across 2 bars
+            # HIGH DENSITY: 12 to 24 grains
             count = random.randint(12, 24)
-            
-            # Allow duplicate slots for layering start times
             active_slots = sorted([random.randint(0, total_slots-1) for _ in range(count)])
             
             reg_len = region[1] - region[0]
@@ -149,28 +219,25 @@ class MicroEngine:
                 r_offset = random.uniform(0, effective_len)
                 s_pt = region[0] + r_offset
                 
-                # DURATION: Long duration (2 to 8 sixteenths) ensures massive overlap
+                # Long duration for overlap
                 dur_factor = random.uniform(2.0, 8.0) 
                 
-                # Calculate lengths
                 max_len_norm = region[1] - s_pt
                 desired_len_samples = int(step_16_sec * dur_factor * sr)
                 desired_len_norm = desired_len_samples / len(data)
                 actual_len_norm = min(desired_len_norm, max_len_norm)
                 e_pt = s_pt + actual_len_norm
                 
-                # Generate
                 raw_chunk, s_idx, e_idx = make_one_cut((s_pt, e_pt))
                 if len(raw_chunk) == 0: continue
                 
                 grain = apply_fx(raw_chunk)
                 
-                # Mix (Additive)
+                # Mix
                 insert_idx = int(slot_idx * step_16_sec * sr)
                 write_len = min(len(grain), seq_len_samples - insert_idx)
                 
                 if write_len > 0:
-                    # Add to buffer (Overlap happens here)
                     seq_buffer[insert_idx : insert_idx + write_len] += grain[:write_len]
                     
                     # Map
@@ -184,8 +251,7 @@ class MicroEngine:
                     else:
                         grain_map.append((p_start_ms, p_end_ms, src_s_norm, src_e_norm))
 
-            # --- SOFT LIMITER ---
-            # With high overlap, amplitude sums up quickly. Normalize softly.
+            # Soft Limiter
             peak = np.max(np.abs(seq_buffer))
             if peak > 0.9:
                 seq_buffer = seq_buffer * (0.9 / peak)
