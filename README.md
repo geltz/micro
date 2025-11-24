@@ -1,12 +1,12 @@
-micro is a granular loop synthesizer and glitch texture generator with a pyqt6 interface.	
+micro is a sound engine and effects processor with a pyqt6 interface.	
 
-it isolates microscopic regions of audio samples to create rhythmic, processed stereo loops with real-time effects.	
+it isolates regions of an audio sample and applies various effects.	
 
 **buttons**
 - clear
 - click (rhythmic impulses)
 - reverse
-- repeat (loop extension)
+- repeat (loop playback)
 - export wav
 
 **sliders**
