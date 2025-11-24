@@ -4,17 +4,16 @@ it isolates regions of an audio sample and applies various effects.
 
 **buttons**
 - clear
-- click (rhythmic impulses)
+- click (short impulses)
 - reverse
 - repeat (loop playback)
 - export wav
 
 **sliders**
 - attack / release
-- auto-pan depth
-- glue reverb
+- pan
+- reverb
 - playback rate
-- tone (filter + drift)
-- soft crush
-
-- compression
+- tone (filter)
+- crush
+- compress  
