@@ -48,16 +48,58 @@ class MicroEngine:
         return (1 - mix) * x + mix * wet
 
     @staticmethod
+    def get_zero_crossing(data, target_idx, search_window=1024):
+        # Clamp bounds
+        start = max(0, target_idx - search_window // 2)
+        end = min(len(data), target_idx + search_window // 2)
+        
+        if start >= end: return target_idx
+        
+        chunk = data[start:end]
+        
+        # If stereo, sum the absolute values to find the quietest combined point
+        if chunk.ndim > 1:
+            # sum absolute amplitudes of channels
+            amp_profile = np.sum(np.abs(chunk), axis=1)
+        else:
+            amp_profile = np.abs(chunk)
+            
+        # Find index of minimum amplitude
+        min_local_idx = np.argmin(amp_profile)
+        
+        return start + min_local_idx
+
+    @staticmethod
     def process_grain(data, sr, region, params):
-        start_idx = int(region[0] * len(data))
-        end_idx = int(region[1] * len(data))
+        # 1. Calculate raw target indices
+        raw_start = int(region[0] * len(data))
+        raw_end = int(region[1] * len(data))
+        
+        # 2. Refine with Zero-Crossing Search (Snap to nearest quiet point)
+        # Search +/- ~500 samples
+        start_idx = MicroEngine.get_zero_crossing(data, raw_start, 1024)
+        end_idx = MicroEngine.get_zero_crossing(data, raw_end, 1024)
         
         if start_idx >= end_idx: return np.zeros((1024, 2), dtype=np.float32)
-        start_idx = max(0, start_idx)
-        end_idx = min(len(data), end_idx)
         
         chunk = data[start_idx:end_idx].copy()
         if len(chunk) == 0: return np.zeros((1024, 2), dtype=np.float32)
+
+        # 3. Safety De-Click (Micro-fades)
+        # Apply a 2ms fade in/out to the raw cut to guarantee 0.0 edges
+        # independent of the user's "Attack/Release" settings.
+        fade_len = min(int(sr * 0.002), len(chunk) // 2) 
+        if fade_len > 0:
+            fade_in = np.linspace(0, 1, fade_len)
+            fade_out = np.linspace(1, 0, fade_len)
+            
+            # Handle dimensions for broadcasting
+            if chunk.ndim > 1:
+                fade_in = fade_in[:, None]
+                fade_out = fade_out[:, None]
+                
+            chunk[:fade_len] *= fade_in
+            chunk[-fade_len:] *= fade_out
 
         # [Mono Processing Chain]
         
@@ -86,67 +128,64 @@ class MicroEngine:
             # Drift
             t = np.linspace(0, len(chunk)/sr, len(chunk))
             mod = 1.0 + (0.15 * (1.0-tone)) * np.sin(2 * np.pi * 2.0 * t)
+            if chunk.ndim > 1: mod = mod[:, None]
             chunk = chunk * mod * (1.0 + (1.0-tone)*0.4)
 
         # Compressor
-        # Pumping effect
         comp = params.get('compress', 0.0)
         if comp > 0.01:
-            # Envelope follower
             sos_env = signal.butter(1, 0.02, output='sos')
-            env = signal.sosfilt(sos_env, np.abs(chunk))
+            # Detect on mono sum if stereo
+            det_sig = np.mean(np.abs(chunk), axis=1) if chunk.ndim > 1 else np.abs(chunk)
+            env = signal.sosfilt(sos_env, det_sig)
             
-            # Threshold drops as comp increases
             thresh = 0.6 * (1.0 - comp * 0.7)
-            
-            # Gain Reduction (Hard Knee)
-            # If env > thresh, reduce gain to match thresh
-            # We add epsilon to avoid div by zero
             gain_red = np.minimum(1.0, thresh / (env + 1e-6))
             
-            # Apply + Makeup Gain (2.5x max)
+            if chunk.ndim > 1: gain_red = gain_red[:, None]
             chunk = chunk * gain_red * (1.0 + comp * 2.5)
 
-        # Envelopes
+        # User Envelopes (Musical ADSR)
         att_p = params.get('attack', 0.01)
         rel_p = params.get('release', 0.01)
         n_samples = len(chunk)
         att_s = int(n_samples * att_p)
         rel_s = int(n_samples * rel_p)
+        
         if att_s + rel_s > n_samples:
             scale = n_samples / (att_s + rel_s + 1)
             att_s = int(att_s * scale)
             rel_s = int(rel_s * scale)
+            
         env_shape = np.ones(n_samples, dtype=np.float32)
         if att_s > 0: env_shape[:att_s] = np.sin(np.linspace(0, np.pi/2, att_s))
         if rel_s > 0: env_shape[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
 
-        # Apply fixed internal gain (0.7)
+        if chunk.ndim > 1: env_shape = env_shape[:, None]
         chunk = chunk * env_shape * 0.7
         
         # Reverb
         chunk = MicroEngine.apply_reverb(chunk, sr, params.get('verb', 0.0) * 0.4)
 
-        # Clicks (Rhythmic & Sparse)
+        # Clicks (Rhythmic)
         if params.get('clicks', False):
+            # Click generation logic (simplified/adapted for stereo safety)
             c_len = min(len(chunk), 2000) 
             if c_len > 100:
-                # Construct Click
-                raw = chunk[100:c_len][::2]
+                raw_src = chunk if chunk.ndim == 1 else chunk[:, 0]
+                raw = raw_src[100:c_len][::2]
                 click_sig = np.diff(raw, prepend=0) 
                 max_val = np.max(np.abs(click_sig))
                 if max_val > 1e-5: click_sig = click_sig / max_val
+                
                 c_env = np.exp(-np.linspace(0, 15, len(click_sig)))
                 click_sig = click_sig * c_env * 2.5 
-
-                # Grid: 1/8th notes at 120 BPM
-                # 1 Beat = 0.5s, 1/8th note = 0.25s
-                grid_step = int(sr * 0.25)
                 
+                if chunk.ndim > 1:
+                    click_sig = np.column_stack((click_sig, click_sig))
+
+                grid_step = int(sr * 0.25)
                 for pos in range(0, len(chunk), grid_step):
-                    # SPARSE CHECK:
-                    # Only play click 35% of the time on the grid
-                    # This creates random gaps while maintaining rhythm
                     if random.random() < 0.35:
                         remaining = len(chunk) - pos
                         write_len = min(len(click_sig), remaining)
@@ -155,24 +194,19 @@ class MicroEngine:
                             chunk[pos:pos+write_len] = np.clip(segment, -1.0, 1.0)
 
         # [Stereo Conversion & Pan]
-        # Make stereo (N, 2)
-        chunk_stereo = np.column_stack((chunk, chunk))
-        
+        if chunk.ndim == 1:
+            chunk_stereo = np.column_stack((chunk, chunk))
+        else:
+            chunk_stereo = chunk
+
         pan_depth = params.get('pan', 0.0)
         if pan_depth > 0.01:
-            # Auto-Pan LFO
-            # "Interpolates pan subtly" -> We interpret this as Auto-Pan intensity
             t = np.linspace(0, len(chunk)/sr, len(chunk))
-            # 1.5Hz gentle swing
             lfo = np.sin(2 * np.pi * 1.5 * t)
-            
-            # Calculate Gain Modifiers
-            # 0.0 = No effect, 1.0 = Full swing
-            # Center (0.5) +/- (depth * 0.5 * lfo)
-            width = pan_depth * 0.6 # Max 60% width for subtlety
+            width = pan_depth * 0.6
             
             l_gain = 1.0 - (width * (0.5 + 0.5 * lfo))
-            r_gain = 1.0 - (width * (0.5 + 0.5 * -lfo)) # Inverse phase
+            r_gain = 1.0 - (width * (0.5 + 0.5 * -lfo))
             
             chunk_stereo[:, 0] *= l_gain
             chunk_stereo[:, 1] *= r_gain
@@ -531,14 +565,38 @@ class ZoomWaveEditor(QWidget):
 
     def mousePressEvent(self, e):
         if self.data is None: return self.import_requested.emit()
+        
         self.last_mouse_x = e.pos().x()
+        w = self.width()
+        vw = 1.0 / self.zoom_level
+        
+        # Calculate current Selection in pixels
+        s, end = min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)
+        s_px = (s - self.view_offset) / vw * w
+        e_px = (end - self.view_offset) / vw * w
+        
+        # Hit detection tolerance
+        tol = 10 
+        
         if e.button() == Qt.MouseButton.RightButton:
-            self.drag_mode = 'pan'; self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.drag_mode = 'pan'
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
         else:
-            self.drag_mode = 'select'
-            vw = 1.0 / self.zoom_level
-            cn = self.view_offset + (e.pos().x()/self.width())*vw
-            self.sel_start = self.sel_end = max(0.0, min(1.0, cn))
+            # 1. Check Edges first (Resize)
+            if abs(e.pos().x() - s_px) < tol:
+                self.drag_mode = 'resize_l'
+            elif abs(e.pos().x() - e_px) < tol:
+                self.drag_mode = 'resize_r'
+            # 2. Check Inside (Move)
+            elif s_px < e.pos().x() < e_px:
+                self.drag_mode = 'move'
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            # 3. Outside (New Selection)
+            else:
+                self.drag_mode = 'new'
+                cn = self.view_offset + (e.pos().x()/w)*vw
+                self.sel_start = self.sel_end = max(0.0, min(1.0, cn))
+            
             self.is_dragging = True
             self.update()
 
@@ -546,24 +604,98 @@ class ZoomWaveEditor(QWidget):
         if self.data is None: return
         x, w = e.pos().x(), self.width()
         vw = 1.0 / self.zoom_level
-        if self.is_dragging:
-            if self.drag_mode == 'pan':
-                dx = (x - self.last_mouse_x) / w
-                self.view_offset = max(0, min(1.0 - vw, self.view_offset - dx*vw))
-                self.cached_px = None # Invalidate cache on pan
-            elif self.drag_mode == 'select':
-                cn = self.view_offset + (x/w)*vw
-                self.sel_end = max(0.0, min(1.0, cn))
-                self.selection_changed.emit((min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)))
-            self.last_mouse_x = x
-            self.update()
+        
+        # --- Hover Cursor Logic (When not dragging) ---
+        if not self.is_dragging:
+            s, end = min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)
+            s_px = (s - self.view_offset) / vw * w
+            e_px = (end - self.view_offset) / vw * w
+            tol = 10
+            
+            if abs(x - s_px) < tol or abs(x - e_px) < tol:
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif s_px < x < e_px:
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
+            else:
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+
+        # --- Dragging Logic ---
+        dx_px = x - self.last_mouse_x
+        dx_norm = (dx_px / w) * vw
+        
+        if self.drag_mode == 'pan':
+            self.view_offset = max(0, min(1.0 - vw, self.view_offset - dx_norm))
+            self.cached_px = None
+            
+        elif self.drag_mode == 'move':
+            # Calculate width to ensure we don't collapse it
+            width = abs(self.sel_end - self.sel_start)
+            # Apply delta
+            new_s = min(self.sel_start, self.sel_end) + dx_norm
+            new_e = new_s + width
+            
+            # Boundary checks
+            if new_s < 0.0:
+                new_s = 0.0
+                new_e = width
+            elif new_e > 1.0:
+                new_e = 1.0
+                new_s = 1.0 - width
+                
+            self.sel_start, self.sel_end = new_s, new_e
+            self.selection_changed.emit((self.sel_start, self.sel_end))
+            
+        elif self.drag_mode == 'resize_l':
+            # Adjust start, allow crossing over
+            # We assume sel_start is the 'left' visual handle for simplicity in storage,
+            # but we use min/max in logic. Here we just update the specific handle found in Press.
+            # To simplify: we assume the user intends to move the boundary closest to them.
+            cur_min = min(self.sel_start, self.sel_end)
+            cur_max = max(self.sel_start, self.sel_end)
+            new_min = max(0.0, min(cur_max, cur_min + dx_norm)) # Clamp to 0 and other edge
+            
+            self.sel_start, self.sel_end = new_min, cur_max
+            self.selection_changed.emit((self.sel_start, self.sel_end))
+            
+        elif self.drag_mode == 'resize_r':
+            cur_min = min(self.sel_start, self.sel_end)
+            cur_max = max(self.sel_start, self.sel_end)
+            new_max = max(cur_min, min(1.0, cur_max + dx_norm)) # Clamp to other edge and 1
+            
+            self.sel_start, self.sel_end = cur_min, new_max
+            self.selection_changed.emit((self.sel_start, self.sel_end))
+            
+        elif self.drag_mode == 'new':
+            cn = self.view_offset + (x/w)*vw
+            self.sel_end = max(0.0, min(1.0, cn))
+            self.selection_changed.emit((min(self.sel_start, self.sel_end), max(self.sel_start, self.sel_end)))
+
+        self.last_mouse_x = x
+        self.update()
             
     def mouseReleaseEvent(self, e):
-        self.is_dragging = False; self.setCursor(Qt.CursorShape.PointingHandCursor)
-        if self.drag_mode == 'select':
-            if self.sel_start > self.sel_end: self.sel_start, self.sel_end = self.sel_end, self.sel_start
-            self.selection_changed.emit((self.sel_start, self.sel_end))
-        elif self.drag_mode is None and self.data is None:
+        # 1. Capture state before resetting
+        was_active = self.is_dragging
+        
+        # 2. Reset Dragging Flags immediately
+        # This is crucial: MainWindow checks this flag to decide whether to play audio.
+        self.is_dragging = False
+        self.drag_mode = None
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        if self.data is not None:
+            # 3. Normalize Selection (ensure start < end)
+            if self.sel_start > self.sel_end:
+                self.sel_start, self.sel_end = self.sel_end, self.sel_start
+            
+            # 4. Trigger Playback
+            # We emit the signal now. Since self.is_dragging is False, 
+            # the MainWindow's auto_prev() will accept this and start the timer.
+            if was_active:
+                self.selection_changed.emit((self.sel_start, self.sel_end))
+        else:
+            # 5. Handle empty state click (Import)
             self.import_requested.emit()
 
     def update_cache(self):
@@ -649,7 +781,7 @@ class ZoomWaveEditor(QWidget):
         if sel_w > 1:
             # Light selection rectangle overlay
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(63, 108, 155, 15))
+            painter.setBrush(QColor(63, 108, 155, 10))
             painter.drawRect(QRectF(sx, 0, sel_w, h))
 
             # Handles
