@@ -33,5 +33,3 @@ middle/right mouse to pan on waveform.
 
 
 
-
-
