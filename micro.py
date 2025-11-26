@@ -90,20 +90,12 @@ class MicroEngine:
                 sos = signal.butter(2, cutoff, 'high', fs=sr, output='sos')
                 chunk = signal.sosfilt(sos, chunk)
 
-        comp = params.get('compress', 0.0)
-        if comp > 0.01:
-            sos_env = signal.butter(1, 0.02, output='sos')
-            det_sig = np.abs(chunk)
-            env = signal.sosfilt(sos_env, det_sig)
-            thresh = 0.6 * (1.0 - comp * 0.7)
-            gain_red = np.minimum(1.0, thresh / (env + 1e-6))
-            chunk = chunk * gain_red * (1.0 + comp * 2.5)
-
         return chunk
 
     @staticmethod
-    def render_playback(source_data, sr, region, params, abort_check=None): # <--- Add arg
-        is_repeat = params.get('repeat', False)
+    def render_playback(source_data, sr, region, params, abort_check=None): 
+        grain_val = params.get('grain', 0.0)
+        is_granular = grain_val > 0.05
         grain_map = []
         
         def process_slice(sub_region):
@@ -143,18 +135,22 @@ class MicroEngine:
             if att_s > 0: env[:att_s] = np.sin(np.linspace(0, np.pi/2, att_s))
             if rel_s > 0: env[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
             chunk *= env * 0.8
-            
-            if params.get('clicks', False):
+
+            click_amt = params.get('clicks', 0.0)
+            if click_amt > 0.01:
                 grid = int(sr * 0.15)
+                # Probability scales with slider
+                prob = 0.1 + (click_amt * 0.4) 
                 for pos in range(0, len(chunk), grid):
-                    if random.random() < 0.3:
+                    if random.random() < prob:
                         click_len = random.randint(400, 1200) 
                         if pos + click_len < len(chunk):
                             freq = random.uniform(300, 1200)
                             t = np.arange(click_len) / sr
                             tone = np.sin(2 * np.pi * freq * t).astype(np.float32)
                             c_env = np.exp(-np.linspace(0, 6, click_len))
-                            burst = tone * c_env * 0.25
+                            # Amplitude scales with slider
+                            burst = tone * c_env * (0.1 + click_amt * 0.3) 
                             chunk[pos:pos+click_len] += burst
 
             if chunk.ndim == 1: chunk = np.column_stack((chunk, chunk))
@@ -172,8 +168,8 @@ class MicroEngine:
 
         final_buffer = None
         
-        if not is_repeat:
-            if abort_check and abort_check(): return None, [] # <--- Check here
+        if not is_granular:
+            if abort_check and abort_check(): return None, [] 
             chunk, s, e = process_slice(region)
             final_buffer = chunk
             grain_map.append((0, (len(chunk)/sr)*1000.0, region[0], region[1]))
@@ -184,15 +180,25 @@ class MicroEngine:
             seq_len = int(total_slots * (beat_sec/4.0) * sr)
             seq_buffer = np.zeros((seq_len, 2), dtype=np.float32)
             
-            count = random.randint(12, 24)
+            # Scale count with slider (12 grains -> 48 grains)
+            # Higher values ensure legato/overlap
+            min_grains = 12
+            max_grains = 48
+            count = int(min_grains + (max_grains - min_grains) * grain_val)
+            
+            # Distribute grains randomly across slots
             slots = sorted([random.randint(0, total_slots-1) for _ in range(count)])
             reg_len = region[1] - region[0]
             
             for slot in slots:
-                if abort_check and abort_check(): return None, [] # <--- Check inside loop
+                if abort_check and abort_check(): return None, []
                 offset = random.uniform(0, max(0, reg_len - 0.001))
                 s_pt = region[0] + offset
-                dur = random.uniform(2.0, 8.0) * (beat_sec/4.0)
+                
+                # Duration logic: ensure overlap for legato feel
+                base_dur = random.uniform(2.0, 8.0) * (beat_sec/4.0)
+                dur = base_dur * (1.0 + grain_val * 0.5) # Extend duration with slider
+                
                 len_norm = dur * sr / len(source_data)
                 e_pt = min(region[1], s_pt + len_norm)
                 
@@ -210,14 +216,29 @@ class MicroEngine:
                     n_e = (s_idx+w_len)/len(source_data)
                     grain_map.append((p_s, p_e, n_s, n_e))
             
+            # Normalize carefully to prevent clipping while maintaining density
             pk = np.max(np.abs(seq_buffer))
-            if pk > 0.9: seq_buffer *= (0.9/pk)
+            if pk > 0.95: seq_buffer *= (0.95/pk)
             final_buffer = seq_buffer
 
-        # Reverb is the most expensive operation.
+        shake_amt = params.get('shake', 0.0)
+        if shake_amt > 0.01 and final_buffer is not None:
+             # Create low frequency random noise curve
+            ln = len(final_buffer)
+            # Create control points (fewer points = slower shake)
+            points = max(5, int(ln / sr * (5 + shake_amt * 15))) 
+            noise_ctrl = np.random.uniform(1.0 - shake_amt, 1.0, points)
+            # Smooth it out
+            shake_env = signal.resample(noise_ctrl, ln)
+            # Apply to stereo channels
+            if final_buffer.ndim > 1:
+                final_buffer *= shake_env[:, None]
+            else:
+                final_buffer *= shake_env
+
         v_amt = params.get('verb', 0.0)
         if v_amt > 0.01:
-            if abort_check and abort_check(): return None, [] # <--- Check before reverb
+            if abort_check and abort_check(): return None, []
             final_buffer = MicroEngine.apply_reverb(final_buffer, sr, v_amt * 0.6)
         
         return np.clip(final_buffer, -0.99, 0.99), grain_map
@@ -326,6 +347,7 @@ class HeaderCanvas(QWidget):
         self.phase = 0.0
         self.speed = 0.05
         self.dots = []
+        # Generate dots as normalized coordinates (0.0 to 1.0)
         cw, ch = 600, 34 
         cx, cy = cw/2, ch/2
         max_dist = math.sqrt(cx*cx + cy*cy)
@@ -335,7 +357,8 @@ class HeaderCanvas(QWidget):
             dist = math.sqrt((x-cx)**2 + (y-cy)**2) / max_dist
             prob = 1.0 - (dist * 0.8)
             if random.random() < prob:
-                self.dots.append([x, y, random.randint(1, 2), random.random(), random.random()*6.28])
+                # Store x, y as ratios of the container size
+                self.dots.append([x/cw, y/ch, random.randint(1, 2), random.random(), random.random()*6.28])
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.animate)
         self.timer.start(20)
@@ -351,14 +374,20 @@ class HeaderCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
+        
         for d in self.dots:
-            x, y, sz, hue, off = d
+            nx, ny, sz, hue, off = d
+            # Calculate actual position based on current window size
+            x = nx * w
+            y = ny * h
+            
             raw_alpha = 0.2 + 0.3 * math.sin(self.phase + off)
             alpha = max(0.0, min(1.0, raw_alpha))
             c = QColor.fromHslF(hue, 0.6, 0.7, alpha)
             painter.setBrush(c)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(x, y), sz, sz)
+            
         path = QPainterPath()
         amp = 6
         freq = 0.02
@@ -417,14 +446,20 @@ class PastelToggle(QWidget):
         cx = 12 if not self.checked else r.width() - 12
         p.setBrush(QColor("white"))
         p.drawEllipse(QPointF(cx, r.height()/2), 8, 8)
+        
+        # Font and Color adjustments
         txt_col = QColor("#64748b") 
         txt_col.setAlpha(180) 
         if self.checked: 
-            txt_col = QColor("#3f6c9b")
-            txt_col.setAlpha(230)
+            # Less blue, more neutral slate gray
+            txt_col = QColor("#475569")
+            txt_col.setAlpha(240)
+            
         p.setPen(txt_col)
-        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        # Weight changed from Bold to Medium (Weight 500)
+        font = QFont("Segoe UI", 9, QFont.Weight.Medium)
         p.setFont(font)
+        
         if self.checked:
             p.drawText(QRectF(0, 0, r.width()-24, r.height()), Qt.AlignmentFlag.AlignCenter, self.label)
         else:
@@ -457,10 +492,13 @@ class PastelPush(QWidget):
         p.setBrush(QBrush(bg_col))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(r, 12, 12)
+        
+        # Font and Color adjustments
         txt_col = QColor("#64748b")
         txt_col.setAlpha(180) 
         p.setPen(txt_col)
-        font = QFont("Segoe UI", 9, QFont.Weight.Bold)
+        # Weight changed from Bold to Medium
+        font = QFont("Segoe UI", 9, QFont.Weight.Medium)
         p.setFont(font)
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.label)
 
@@ -470,14 +508,23 @@ class PastelExportButton(QPushButton):
         self.setFixedHeight(30)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.phase = 0.0
+        self.hover_anim = 0.0 # New interpolation value
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.animate)
-        self.timer.start(50)
+        self.timer.start(20) # Faster tick for smooth animation
         self.hovered = False
 
     def animate(self):
         self.phase = (self.phase + 0.01) % 1.0
-        if self.hovered: self.update()
+        
+        # Smooth interpolation of hover state
+        target = 1.0 if self.hovered else 0.0
+        diff = target - self.hover_anim
+        if abs(diff) > 0.01:
+            self.hover_anim += diff * 0.15 # Ease speed
+            self.update()
+        elif self.hovered: 
+            self.update() # Keep updating for phase shift if hovered
 
     def enterEvent(self, e): self.hovered = True; self.update()
     def leaveEvent(self, e): self.hovered = False; self.update()
@@ -487,18 +534,26 @@ class PastelExportButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         rect = self.rect()
         grad = QLinearGradient(0, 0, rect.width(), 0)
+        
+        # Interpolate saturation and lightness based on hover_anim
+        base_s, base_l = 0.4, 0.94
+        hover_s, hover_l = 0.6, 0.85
+        
+        cur_s = base_s + (hover_s - base_s) * self.hover_anim
+        cur_l = base_l + (hover_l - base_l) * self.hover_anim
+        
         for i in range(3):
             t = i / 2.0
             h = (self.phase + t * 0.2) % 1.0
-            s = 0.6 if self.hovered else 0.4
-            l = 0.85 if self.hovered else 0.94
-            grad.setColorAt(t, QColor.fromHslF(h, s, l))
+            grad.setColorAt(t, QColor.fromHslF(h, cur_s, cur_l))
+            
         painter.setBrush(grad)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(rect, 4, 4)
         painter.setPen(QColor("#94a3b8"))
         painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.text())
+        
         l_grad = QLinearGradient(0, 0, 15, 0)
         l_grad.setColorAt(0.0, QColor(255, 255, 255, 150))
         l_grad.setColorAt(1.0, QColor(255, 255, 255, 0))
@@ -805,20 +860,33 @@ class ZoomWaveEditor(QWidget):
             for (p_start, p_end, src_start, src_end) in self.grain_map:
                 if p_start <= self.current_loop_ms < p_end:
                     
+                    # Life cycle of the grain (0.0 to 1.0)
                     progress = (self.current_loop_ms - p_start) / (p_end - p_start)
+                    
+                    # Calculate position
                     cur_src = src_start + (src_end - src_start) * progress
                     gx = (cur_src - self.view_offset) / vw * w
                     
                     if 0 <= gx <= w:
                         hue = (cur_src * 5.0 + self.hue_anim) % 1.0
-                        col = QColor.fromHslF(hue, 0.6, 0.75, 0.35) 
                         
-                        painter.setBrush(col)
-                        painter.setPen(QPen(QColor(255, 255, 255, 100), 0.5))
+                        # Soft Fade: Sine wave curve for opacity (starts 0, peaks, ends 0)
+                        fade_curve = math.sin(progress * math.pi)
+                        alpha = int(180 * fade_curve) # Max alpha 180
                         
                         tri_h = 55  
-                        tri_w = 8   
+                        tri_w = 12   
                         y_base = h  
+                        
+                        # Use a gradient for the triangle itself (fade out towards top)
+                        t_grad = QLinearGradient(gx, y_base, gx, y_base - tri_h)
+                        col_btm = QColor.fromHslF(hue, 0.6, 0.75, alpha/255.0)
+                        col_top = QColor.fromHslF(hue, 0.6, 0.75, 0.0)
+                        t_grad.setColorAt(0.0, col_btm)
+                        t_grad.setColorAt(1.0, col_top)
+                        
+                        painter.setBrush(QBrush(t_grad))
+                        painter.setPen(Qt.PenStyle.NoPen)
                         
                         tri = QPolygonF([
                             QPointF(gx, y_base - tri_h),
@@ -870,19 +938,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("micro")
-        self.worker_thread = None      # The currently running thread
-        self.update_pending = False    # Do we need to recalc after current finishes?
-        self.old_threads = []          # Garbage collection "waiting room"
+        self.worker_thread = None      
+        self.update_pending = False    
+        self.old_threads = []          
         self.resize(650, 520)
         self.setAcceptDrops(True)
         self.data, self.sr, self.p_data, self.tf = None, 44100, None, None
-        # Thread Locking State
         self.is_processing = False
         self.update_pending = False
         
-        self.dsp_cache = None
-        self.dsp_hash = None 
-
         self.dsp_cache = None
         self.dsp_hash = None 
         
@@ -894,26 +958,23 @@ class MainWindow(QMainWindow):
         self.player.setAudioOutput(self.ao)
         self.player.mediaStatusChanged.connect(self.media_status)
         
-        # --- New fader animation ---
         self.vol_anim = QPropertyAnimation(self.ao, b"volume")
-        self.vol_anim.setDuration(250) # 250ms fade out
+        self.vol_anim.setDuration(250)
         self.vol_anim.setEndValue(0.0)
         self.vol_anim.setEasingCurve(QEasingCurve.Type.Linear)
-        # ---------------------------   
        
         self.last_media_pos = 0
         self.last_update_time = 0
-        self.ao = QAudioOutput()
-        self.player.setAudioOutput(self.ao)
-        self.player.mediaStatusChanged.connect(self.media_status)
         
         cw = QWidget()
         self.setCentralWidget(cw)
         mv = QVBoxLayout(cw)
         mv.setContentsMargins(25, 15, 25, 20)
         mv.setSpacing(12)
+        
         self.header = HeaderCanvas()
         mv.addWidget(self.header)
+        
         wfr = QFrame()
         wfr.setStyleSheet("background: #f6f9fc; border-radius: 8px; border: 1px solid #e2e8f0;")
         wl = QVBoxLayout(wfr); wl.setContentsMargins(1,1,1,1)
@@ -922,46 +983,56 @@ class MainWindow(QMainWindow):
         self.wave.selection_changed.connect(self.set_reg)
         wl.addWidget(self.wave)
         mv.addWidget(wfr, 1)
+        
+        # --- CONTROLS LAYOUT ---
         crow = QHBoxLayout(); crow.setSpacing(30)
+        
+        # Column 1 (Left)
         c1 = QVBoxLayout(); c1.setSpacing(4)
         self.k_att = ControlRow("attack", 0, 0.5, 0.01)
         self.k_rel = ControlRow("release", 0, 0.5, 0.1)
         self.k_pan = ControlRow("pan", 0.0, 1.0, 0.0) 
         self.k_verb = ControlRow("reverb", 0, 1, 0.0)
-        for w in [self.k_att, self.k_rel, self.k_pan, self.k_verb]: c1.addWidget(w)
+        self.k_clk = ControlRow("click", 0, 1, 0.0) # NEW CLICK SLIDER
+        for w in [self.k_att, self.k_rel, self.k_pan, self.k_verb, self.k_clk]: c1.addWidget(w)
         c1.addStretch()
+        
+        # Column 2 (Right)
         c2 = QVBoxLayout(); c2.setSpacing(4)
         self.k_pt = ControlRow("rate", 0.5, 2.0, 1.0, "{:.2f}x")
         self.k_tn = ControlRow("tone", 0, 1, 0.5) 
         self.k_cr = ControlRow("crush", 0, 1, 0.0)
-        self.k_cmp = ControlRow("comp", 0, 1, 0.0) 
-        for w in [self.k_pt, self.k_tn, self.k_cr, self.k_cmp]: c2.addWidget(w)
+        self.k_shk = ControlRow("shake", 0, 1, 0.0) # NEW SHAKE SLIDER
+        self.k_grn = ControlRow("grain", 0, 1, 0.0) # NEW GRAIN SLIDER
+        for w in [self.k_pt, self.k_tn, self.k_cr, self.k_shk, self.k_grn]: c2.addWidget(w)
         c2.addStretch()
+        
         crow.addLayout(c1, 1); crow.addLayout(c2, 1)
         mv.addLayout(crow)
+        
+        # --- TOGGLES ROW ---
         t_row = QHBoxLayout()
         t_row.addStretch()
         self.btn_clear = PastelPush("clear")
         self.btn_clear.clicked.connect(self.clear_state)
         t_row.addWidget(self.btn_clear)
         t_row.addSpacing(10)
-        self.t_clk = PastelToggle("click")
-        self.t_clk.stateChanged.connect(self.auto_prev)
-        t_row.addWidget(self.t_clk)
-        t_row.addSpacing(10)
+        
         self.t_rev = PastelToggle("reverse")
         t_row.addWidget(self.t_rev)
-        t_row.addSpacing(10)
-        self.t_rep = PastelToggle("grain")
-        self.t_rep.stateChanged.connect(self.auto_prev)
-        t_row.addWidget(self.t_rep)
         t_row.addStretch()
+        
         mv.addLayout(t_row)
+        
         self.btn_ex = PastelExportButton("export")
         self.btn_ex.clicked.connect(self.export)
         mv.addWidget(self.btn_ex)
-        for k in [self.k_att, self.k_rel, self.k_pan, self.k_verb, self.k_pt, self.k_tn, self.k_cr, self.k_cmp]:
+        
+        # Connections
+        for k in [self.k_att, self.k_rel, self.k_pan, self.k_verb, self.k_clk, 
+                  self.k_pt, self.k_tn, self.k_cr, self.k_shk, self.k_grn]:
             k.valueChanged.connect(self.auto_prev)
+            
         self.t_rev.stateChanged.connect(self.auto_prev)
         self.ptimer = QTimer(interval=150, singleShot=True, timeout=self.prev)
         self.atimer = QTimer(interval=16, timeout=self.tick)
@@ -977,10 +1048,10 @@ class MainWindow(QMainWindow):
                 'reverse': self.t_rev.checked,
                 'rate': self.k_pt.value(), 'tone': self.k_tn.value(),
                 'crush': self.k_cr.value(), 
-                'compress': self.k_cmp.value(),
+                'shake': self.k_shk.value(),
                 'verb': self.k_verb.value(), 
-                'clicks': self.t_clk.checked,
-                'repeat': self.t_rep.checked}
+                'clicks': self.k_clk.value(), # Now a float 0-1
+                'grain': self.k_grn.value()}  # Now a float 0-1
 
     def prev(self):
         # If we are already running, don't stack another thread on top.
@@ -1006,9 +1077,8 @@ class MainWindow(QMainWindow):
 
         p = self.get_p()
 
-        # Include self.c_reg (region) in the hash key. 
-        # Changing region invalidates the cache because the slice changes.
-        current_hash = (p['tone'], p['crush'], p['compress'], self.c_reg)
+        # Update Hash: crush, tone stay. Shake is post-fx (render), so it doesn't need to be in the heavy_fx hash.
+        current_hash = (p['tone'], p['crush'], self.c_reg)
         
         cached_source = None
         if self.dsp_cache is not None and self.dsp_hash == current_hash:
@@ -1059,7 +1129,7 @@ class MainWindow(QMainWindow):
         if new_cache is not None:
             self.dsp_cache = new_cache
             p = self.get_p()
-            self.dsp_hash = (p['tone'], p['crush'], p['compress'])
+            self.dsp_hash = (p['tone'], p['crush'], self.c_reg)
 
         self.p_data = d 
         self.grain_map = g_map
@@ -1109,7 +1179,8 @@ class MainWindow(QMainWindow):
                 current_loop_ms = est_pos % total_dur_ms
                 self.wave.set_playback_pos(current_loop_ms)
                 
-                if self.t_rep.checked:
+                # Check grain slider instead of checkbox
+                if self.k_grn.value() > 0.05:
                     self.wave.set_play_head(-1) 
                 else:
                     self.wave.set_play_head(current_loop_ms / total_dur_ms)
@@ -1119,7 +1190,8 @@ class MainWindow(QMainWindow):
 
     def media_status(self, s):
         if s == QMediaPlayer.MediaStatus.EndOfMedia:
-            if self.t_rep.checked:
+            # Check grain slider instead of checkbox
+            if self.k_grn.value() > 0.05:
                 self.player.setPosition(0)
                 self.player.play()
             else:
