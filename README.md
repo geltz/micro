@@ -15,22 +15,17 @@ middle/right mouse to pan on waveform.
 - clear
 - export  
 
-**toggles**
-- click    
+**toggles** 
 - reverse
-- grain  
 
 **sliders**
-- attack / release
+- attack
+- release
 - pan
 - reverb
-- playback rate
+- click
+- rate
 - tone    
 - crush
-- compress  
-
-
-
-
-
-
+- shake
+- grain
