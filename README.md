@@ -30,4 +30,5 @@ middle/right mouse to pan on waveform.
 - shake
 - grain
 
-this program is free but [donations are welcome](https://ko-fi.com/geltz)
+this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
