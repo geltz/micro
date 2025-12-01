@@ -339,7 +339,13 @@ class MicroEngine:
                     dur_samps = int((random.uniform(1.0, 4.0) / 1000.0) * sr)
                     
                     if pos + dur_samps < buffer_len:
-                        freq = random.uniform(800, 2000)
+                        # --- Lower Tone Chance & Higher Volume ---
+                        # 30% chance for low thud, else high click
+                        if random.random() < 0.3:
+                            freq = random.uniform(60, 300)
+                        else:
+                            freq = random.uniform(800, 22000)
+                            
                         t = np.arange(dur_samps) / sr
                         
                         # Original amplitude - more audible
@@ -347,8 +353,9 @@ class MicroEngine:
                         tone_wave += 0.3 * np.sin(2 * np.pi * freq * 2 * t)
                         
                         c_env = np.power(np.linspace(1, 0, dur_samps), 3.0)
-                        # INCREASED AMPLITUDE HERE (0.03 + click_amt * 0.08)
-                        burst = tone_wave * c_env * (0.03 + click_amt * 0.08)
+                        
+                        # Louder clicks
+                        burst = tone_wave * c_env * (0.15 + click_amt * 0.25)
                         
                         if crush_amt > 0.01: 
                             burst = MicroEngine.apply_lofi(burst, crush_amt)
@@ -1426,7 +1433,6 @@ class MainWindow(QMainWindow):
             # Python can safely Garbage Collect it.
 
     def on_fin(self, d, sr, g_map, new_cache):
-
         self.is_processing = False
 
         if new_cache is not None:
@@ -1456,6 +1462,15 @@ class MainWindow(QMainWindow):
             self.ao.setVolume(1.0) 
             
             self.player.setSource(QUrl.fromLocalFile(p))
+
+            # --- FIX START: Native Looping ---
+            # Use native backend looping for gapless granular playback
+            if self.k_grn.value() > 0.05:
+                self.player.setLoops(QMediaPlayer.Loops.Infinite)
+            else:
+                self.player.setLoops(QMediaPlayer.Loops.Once)
+            # --- FIX END ---
+
             self.player.play()
             self.btn_play.set_state(1) # Set to Playing
             self.atimer.start()
@@ -1520,10 +1535,9 @@ class MainWindow(QMainWindow):
 
     def media_status(self, s):
         if s == QMediaPlayer.MediaStatus.EndOfMedia:
-            if self.k_grn.value() > 0.05:
-                self.player.setPosition(0)
-                self.player.play()
-            else:
+            # --- FIX START: Only stop if NOT granular ---
+            # If granular, we let native setLoops(Infinite) handle it
+            if self.k_grn.value() <= 0.05:
                 self.wave.set_play_head(-1)
                 self.atimer.stop()
                 self.btn_play.set_state(2) # Paused/Ready
