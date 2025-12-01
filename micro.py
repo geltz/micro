@@ -19,8 +19,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QSizePolicy, QCheckBox)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
-# --- AUDIO ENGINE ---
-
 class MicroEngine:
     @staticmethod
     def load_file(path):
@@ -35,11 +33,13 @@ class MicroEngine:
     @staticmethod
     def apply_reverb(x, sr, mix=0.3):
         if mix <= 0.01: return x
-        tail_len = int(sr * 1.5) 
+        
+        tail_len = int(sr * 1.0) 
         noise = np.random.randn(tail_len)
-        env = np.exp(-np.linspace(0, 1, tail_len) * 6.0)
+        env = np.exp(-np.linspace(0, 1, tail_len) * 8.0)
         ir = noise * env
-        b, a = signal.butter(1, 0.4, 'low')
+        
+        b, a = signal.butter(1, 300 / (sr/2), 'high')
         ir = signal.lfilter(b, a, ir)
         
         padding = np.zeros((tail_len, x.shape[1] if x.ndim > 1 else 1), dtype=np.float32)
@@ -47,12 +47,13 @@ class MicroEngine:
         padded_x = np.concatenate([x, padding])
         
         wet = signal.fftconvolve(padded_x, ir[:, None] if ir.ndim==1 else ir, mode='full')
-        
         wet = wet[:len(padded_x)]
         wet = wet / (np.max(np.abs(wet)) + 1e-9)
         
-        out = (1 - mix) * padded_x + mix * wet
-        return out
+        dry_lvl = 1.0 - (mix * 0.15) 
+        wet_lvl = mix * 0.35
+        out = (padded_x * dry_lvl) + (wet * wet_lvl)
+        return np.tanh(out)
 
     @staticmethod
     def get_zero_crossing(data, target_idx, search_window=1024):
@@ -66,16 +67,29 @@ class MicroEngine:
         return start + min_local_idx
 
     @staticmethod
+    def apply_lofi(data, factor_0_to_1):
+        if factor_0_to_1 <= 0.01: return data
+        step = int(1 + factor_0_to_1 * 4)
+        if step > 1:
+            down = data[::step]
+            if data.ndim > 1:
+                up = np.repeat(down, step, axis=0)
+            else:
+                up = np.repeat(down, step)
+            if len(up) > len(data):
+                up = up[:len(data)]
+            elif len(up) < len(data):
+                diff = len(data) - len(up)
+                padding = np.tile(up[-1:], (diff, 1)) if data.ndim > 1 else np.tile(up[-1:], diff)
+                up = np.concatenate([up, padding])
+            return up
+        return data
+
+    @staticmethod
     def precompute_heavy_fx(data, sr, params):
         chunk = data.copy()
-        
         crush = params.get('crush', 0.0)
-        if crush > 0.01:
-            factor = 1.0 - (crush * 0.98) 
-            target_len = int(len(chunk) * factor)
-            if target_len > 5:
-                down = signal.resample(chunk, target_len)
-                chunk = signal.resample(down, len(chunk))
+        chunk = MicroEngine.apply_lofi(chunk, crush)
 
         tone = params.get('tone', 0.5)
         if abs(tone - 0.5) > 0.05:
@@ -89,7 +103,6 @@ class MicroEngine:
                 cutoff = 20 + (8000 * (norm ** 2))
                 sos = signal.butter(2, cutoff, 'high', fs=sr, output='sos')
                 chunk = signal.sosfilt(sos, chunk)
-
         return chunk
 
     @staticmethod
@@ -98,6 +111,7 @@ class MicroEngine:
         is_granular = grain_val > 0.05
         grain_map = []
         
+        # --- PROCESS SLICE (No Clicks Here) ---
         def process_slice(sub_region):
             raw_start = int(sub_region[0] * len(source_data))
             raw_end = int(sub_region[1] * len(source_data))
@@ -136,23 +150,6 @@ class MicroEngine:
             if rel_s > 0: env[-rel_s:] = np.cos(np.linspace(0, np.pi/2, rel_s))
             chunk *= env * 0.8
 
-            click_amt = params.get('clicks', 0.0)
-            if click_amt > 0.01:
-                grid = int(sr * 0.15)
-                # Probability scales with slider
-                prob = 0.1 + (click_amt * 0.4) 
-                for pos in range(0, len(chunk), grid):
-                    if random.random() < prob:
-                        click_len = random.randint(400, 1200) 
-                        if pos + click_len < len(chunk):
-                            freq = random.uniform(300, 1200)
-                            t = np.arange(click_len) / sr
-                            tone = np.sin(2 * np.pi * freq * t).astype(np.float32)
-                            c_env = np.exp(-np.linspace(0, 6, click_len))
-                            # Amplitude scales with slider
-                            burst = tone * c_env * (0.1 + click_amt * 0.3) 
-                            chunk[pos:pos+click_len] += burst
-
             if chunk.ndim == 1: chunk = np.column_stack((chunk, chunk))
             
             pan = params.get('pan', 0.0)
@@ -168,6 +165,7 @@ class MicroEngine:
 
         final_buffer = None
         
+        # --- GENERATE BASE BUFFER ---
         if not is_granular:
             if abort_check and abort_check(): return None, [] 
             chunk, s, e = process_slice(region)
@@ -176,36 +174,36 @@ class MicroEngine:
         else:
             bpm = random.randint(90, 120)
             beat_sec = 60.0 / bpm
+            slot_dur = beat_sec / 4.0 
             total_slots = 32
-            seq_len = int(total_slots * (beat_sec/4.0) * sr)
+            seq_len = int(total_slots * slot_dur * sr)
             seq_buffer = np.zeros((seq_len, 2), dtype=np.float32)
             
-            # Scale count with slider (12 grains -> 48 grains)
-            # Higher values ensure legato/overlap
-            min_grains = 12
-            max_grains = 48
+            min_grains = 20  
+            max_grains = 60 
             count = int(min_grains + (max_grains - min_grains) * grain_val)
             
-            # Distribute grains randomly across slots
             slots = sorted([random.randint(0, total_slots-1) for _ in range(count)])
-            reg_len = region[1] - region[0]
             
             for slot in slots:
                 if abort_check and abort_check(): return None, []
-                offset = random.uniform(0, max(0, reg_len - 0.001))
-                s_pt = region[0] + offset
-                
-                # Duration logic: ensure overlap for legato feel
-                base_dur = random.uniform(2.0, 8.0) * (beat_sec/4.0)
-                dur = base_dur * (1.0 + grain_val * 0.5) # Extend duration with slider
-                
+                base_dur_slots = random.uniform(2.0, 5.0)
+                dur = base_dur_slots * slot_dur * (1.0 + grain_val * 0.5)
                 len_norm = dur * sr / len(source_data)
-                e_pt = min(region[1], s_pt + len_norm)
                 
+                max_start = max(region[0], region[1] - len_norm)
+                if max_start <= region[0]: s_pt = region[0]
+                else:
+                    offset = random.uniform(0, max_start - region[0])
+                    s_pt = region[0] + offset
+                
+                e_pt = min(region[1], s_pt + len_norm)
+                if e_pt - s_pt < 0.001: continue
+
                 grain, s_idx, e_idx = process_slice((s_pt, e_pt))
                 if len(grain) == 0: continue
                 
-                ins_idx = int(slot * (beat_sec/4.0) * sr)
+                ins_idx = int(slot * slot_dur * sr)
                 w_len = min(len(grain), seq_len - ins_idx)
                 if w_len > 0:
                     seq_buffer[ins_idx:ins_idx+w_len] += grain[:w_len]
@@ -216,26 +214,65 @@ class MicroEngine:
                     n_e = (s_idx+w_len)/len(source_data)
                     grain_map.append((p_s, p_e, n_s, n_e))
             
-            # Normalize carefully to prevent clipping while maintaining density
             pk = np.max(np.abs(seq_buffer))
             if pk > 0.95: seq_buffer *= (0.95/pk)
             final_buffer = seq_buffer
 
+        # --- GLOBAL POST-PROCESSING ---
+        
+        # 1. CLICKS (Now applied ONCE to the final buffer)
+        click_amt = params.get('clicks', 0.0)
+        if click_amt > 0.01 and final_buffer is not None:
+            c_bpm = random.randint(90, 150)
+            divs = [0.5, 0.25] 
+            step_len = (60.0/c_bpm) * random.choice(divs)
+            grid_sz = int(step_len * sr)
+            
+            prob = 0.1 + (click_amt * 0.6)
+            last_end_pos = 0
+            crush_amt = params.get('crush', 0.0)
+            
+            # Iterate over the length of the FINAL buffer
+            buffer_len = len(final_buffer)
+            
+            for pos in range(0, buffer_len, grid_sz):
+                if pos > last_end_pos and random.random() < prob:
+                    dur_samps = int((random.uniform(2.0, 8.0) / 1000.0) * sr)
+                    
+                    if pos + dur_samps < buffer_len:
+                        freq = random.uniform(1000, 4000)
+                        t = np.arange(dur_samps) / sr
+                        tone_wave = np.sin(2 * np.pi * freq * t).astype(np.float32)
+                        
+                        # Envelope
+                        c_env = np.power(np.linspace(1, 0, dur_samps), 4.0)
+                        burst = tone_wave * c_env * (0.05 + click_amt * 0.15)
+                        
+                        # Apply Crush to click
+                        if crush_amt > 0.01: 
+                            burst = MicroEngine.apply_lofi(burst, crush_amt)
+                        
+                        # Add to buffer
+                        if final_buffer.ndim > 1: 
+                            final_buffer[pos:pos+dur_samps] += burst[:, None]
+                        else: 
+                            final_buffer[pos:pos+dur_samps] += burst
+                            
+                        last_end_pos = pos + dur_samps
+
+        # 2. SHAKE
         shake_amt = params.get('shake', 0.0)
         if shake_amt > 0.01 and final_buffer is not None:
-             # Create low frequency random noise curve
             ln = len(final_buffer)
-            # Create control points (fewer points = slower shake)
             points = max(5, int(ln / sr * (5 + shake_amt * 15))) 
             noise_ctrl = np.random.uniform(1.0 - shake_amt, 1.0, points)
-            # Smooth it out
             shake_env = signal.resample(noise_ctrl, ln)
-            # Apply to stereo channels
             if final_buffer.ndim > 1:
                 final_buffer *= shake_env[:, None]
             else:
                 final_buffer *= shake_env
 
+        # 3. REVERB
         v_amt = params.get('verb', 0.0)
         if v_amt > 0.01:
             if abort_check and abort_check(): return None, []
@@ -502,6 +539,96 @@ class PastelPush(QWidget):
         p.setFont(font)
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.label)
 
+class MorphPlayButton(QWidget):
+    clicked = pyqtSignal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(100, 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._state = 0 
+        self._hover = False
+        self.anim_val = 0.0 
+        self.icon_morph = 0.0 
+        
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.animate)
+        self.timer.start(20)
+
+    def set_state(self, s):
+        self._state = s
+        self.update()
+
+    def mousePressEvent(self, e): self.clicked.emit()
+    def enterEvent(self, e): self._hover = True
+    def leaveEvent(self, e): self._hover = False
+
+    def animate(self):
+        target_anim = 0.0 if self._state == 0 else 1.0
+        self.anim_val += (target_anim - self.anim_val) * 0.25
+        
+        target_morph = 1.0 if self._state == 1 else 0.0
+        self.icon_morph += (target_morph - self.icon_morph) * 0.25
+        
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        
+        # Use QRectF center for float precision
+        c = QRectF(r).center()
+        
+        # Background: Constant color (No hover darken)
+        bg = QColor("#e2e8f0")
+        p.setBrush(bg)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(r, 12, 12)
+        
+        # Foreground
+        fg = QColor("#64748b")
+        fg.setAlpha(180) 
+        p.setBrush(fg)
+        
+        # Dot (Idle State)
+        dot_sz = 4.0 * (1.0 - self.anim_val)
+        if dot_sz > 0.1:
+            p.drawEllipse(c, dot_sz, dot_sz)
+            
+        # Icon Morph
+        if self.anim_val > 0.01:
+            scale = self.anim_val
+            p.translate(c)
+            p.scale(scale, scale)
+            t = self.icon_morph
+            
+            # Geometry
+            p1x = -3.0 * (1.0-t) + (-5.0) * t
+            p1y = -5.0 
+            p2x = -3.0 * (1.0-t) + (-5.0) * t
+            p2y = 5.0 
+            p3x = 6.0 * (1.0-t) + (-2.0) * t
+            p3y = 0.0 * (1.0-t) + (5.0) * t
+            p4x = 6.0 * (1.0-t) + (-2.0) * t
+            p4y = 0.0 * (1.0-t) + (-5.0) * t
+            
+            path = QPainterPath()
+            path.moveTo(p1x, p1y)
+            path.lineTo(p2x, p2y)
+            path.lineTo(p3x, p3y)
+            path.lineTo(p4x, p4y)
+            path.closeSubpath()
+            p.drawPath(path)
+            
+            # Right Pause Bar
+            if t > 0.01:
+                current_alpha = int(180 * t)
+                fg.setAlpha(current_alpha)
+                p.setBrush(fg)
+                
+                off = (1.0 - t) * 1.5
+                p.drawRect(QRectF(2.0 + off, -5.0, 3.0, 10.0))
+
 class PastelExportButton(QPushButton):
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
@@ -641,7 +768,8 @@ class ZoomWaveEditor(QWidget):
         self.update()
     
     def advance_anim(self):
-        self.hue_anim = (self.hue_anim + 0.005) % 1.0
+        # 0.002 instead of 0.005
+        self.hue_anim = (self.hue_anim + 0.002) % 1.0
         self.update()
 
     def resizeEvent(self, e):
@@ -766,10 +894,16 @@ class ZoomWaveEditor(QWidget):
             
     def mouseReleaseEvent(self, e):
         was_active = self.is_dragging
+        last_mode = self.drag_mode 
+        
         self.is_dragging = False
         self.drag_mode = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         
+        # Do not trigger processing if we were just panning
+        if last_mode == 'pan':
+            return 
+
         if self.data is not None:
             if self.sel_start > self.sel_end:
                 self.sel_start, self.sel_end = self.sel_end, self.sel_start
@@ -814,10 +948,12 @@ class ZoomWaveEditor(QWidget):
         for i in range(len(x_steps)):
             path.lineTo(x_steps[i], y_steps[i])
 
+        # RICHER PASTEL GRADIENT (Better visibility for pulse)
         grad_wave = QLinearGradient(0, 0, w, 0)
-        grad_wave.setColorAt(0.0, QColor("#ff9a9e"))
-        grad_wave.setColorAt(0.5, QColor("#fad0c4"))
-        grad_wave.setColorAt(1.0, QColor("#a18cd1"))
+        grad_wave.setColorAt(0.0, QColor("#ff9aa2")) # Richer Pastel Red
+        grad_wave.setColorAt(0.35, QColor("#e0b0ff")) # Richer Lilac
+        grad_wave.setColorAt(0.7, QColor("#b5b9ff")) # Richer Periwinkle
+        grad_wave.setColorAt(1.0, QColor("#97c2fc")) # Richer Blue
         
         wave_pen = QPen(QBrush(grad_wave), 1.5)
         wave_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -830,7 +966,15 @@ class ZoomWaveEditor(QWidget):
         if self.cached_px is None: self.update_cache()
         painter = QPainter(self)
         w, h = self.width(), self.height()
+        
+        # 1. Background with VISIBLE ETHEREAL PULSE
+        # Speed: 8x faster (was too slow). Depth: 0.6 to 1.0 (wider range).
+        pulse_opacity = 0.8 + 0.2 * math.sin(self.hue_anim * 8 * math.pi)
+        
+        painter.save()
+        painter.setOpacity(pulse_opacity)
         painter.drawPixmap(0, 0, self.cached_px)
+        painter.restore()
 
         if self.data is None: return
 
@@ -841,69 +985,111 @@ class ZoomWaveEditor(QWidget):
         ex = (e - self.view_offset) / vw * w
         sel_w = ex - sx
 
+        # 2. Draw Grains
+        if self.grain_map and self.current_loop_ms >= 0:
+            painter.save()
+            if sel_w > 0:
+                painter.setClipRect(QRectF(sx, 0, sel_w, float(h)))
+            
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            show_trails = len(self.grain_map) > 5
+            fade_window = 150.0 
+            
+            for (p_start, p_end, src_start, src_end) in self.grain_map:
+                if p_start <= self.current_loop_ms < (p_end + fade_window):
+                    is_dying = self.current_loop_ms >= p_end
+                    
+                    if is_dying:
+                        progress = 1.0
+                        death_prog = (self.current_loop_ms - p_end) / fade_window
+                        base_alpha = max(0, int(100 * (1.0 - death_prog)))
+                    else:
+                        progress = (self.current_loop_ms - p_start) / (p_end - p_start)
+                        fade_curve = math.sin(progress * math.pi)
+                        base_alpha = 100 + int(155 * fade_curve)
+
+                    cur_src = src_start + (src_end - src_start) * progress
+                    gx = (cur_src - self.view_offset) / vw * w
+                    
+                    if gx < sx - 50 or gx > ex + 50: continue
+
+                    hue = (cur_src * 2.0 + self.hue_anim) % 1.0
+                    tri_h = 24  
+                    tri_w = 12  
+                    y_base = float(h)
+                    
+                    if show_trails and not is_dying:
+                        trail_lag = 0.05
+                        if progress > trail_lag:
+                            trail_prog = progress - trail_lag
+                            trail_src = src_start + (src_end - src_start) * trail_prog
+                            tx = (trail_src - self.view_offset) / vw * w
+                            
+                            if abs(gx - tx) < w * 0.15:
+                                trail_grad = QLinearGradient(gx, y_base, tx, y_base)
+                                c_start = QColor.fromHslF(hue, 0.6, 0.8, base_alpha/255.0 * 0.6) 
+                                c_end = QColor.fromHslF(hue, 0.6, 0.8, 0.0)
+                                trail_grad.setColorAt(0.0, c_start)
+                                trail_grad.setColorAt(1.0, c_end)
+                                
+                                painter.setBrush(QBrush(trail_grad))
+                                painter.setPen(Qt.PenStyle.NoPen)
+                                
+                                trail_poly = QPolygonF([
+                                    QPointF(gx, y_base - tri_h + 5),
+                                    QPointF(gx, y_base),
+                                    QPointF(tx, y_base),
+                                    QPointF(tx, y_base - 2)
+                                ])
+                                painter.drawPolygon(trail_poly)
+
+                    t_grad = QLinearGradient(gx, y_base, gx, y_base - tri_h)
+                    col_btm = QColor.fromHslF(hue, 0.6, 0.75, base_alpha/255.0)
+                    col_top = QColor.fromHslF(hue, 0.6, 0.85, (base_alpha*0.5)/255.0)
+                    t_grad.setColorAt(0.0, col_btm)
+                    t_grad.setColorAt(1.0, col_top)
+                    
+                    painter.setBrush(QBrush(t_grad))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    
+                    tri = QPolygonF([
+                        QPointF(gx, y_base - tri_h),
+                        QPointF(gx - tri_w/2, y_base),
+                        QPointF(gx + tri_w/2, y_base)
+                    ])
+                    painter.drawPolygon(tri)
+            
+            painter.restore()
+
+        # 3. Selection Overlay
         if sel_w > 1:
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(63, 108, 155, 10))
-            painter.drawRect(QRectF(sx, 0, sel_w, h))
-            grad_h = QLinearGradient(0, 0, 0, h)
+            painter.setBrush(QColor(63, 108, 155, 5))
+            painter.drawRect(QRectF(sx, 0, sel_w, float(h)))
+            
+            grad_h = QLinearGradient(0, 0, 0, float(h))
             h1 = self.hue_anim
             h2 = (self.hue_anim + 0.3) % 1.0
             grad_h.setColorAt(0, QColor.fromHslF(h1, 0.5, 0.8))
             grad_h.setColorAt(1, QColor.fromHslF(h2, 0.5, 0.8))
             brush = QBrush(grad_h)
-            painter.fillRect(QRectF(sx, 0, 3, h), brush)
-            painter.fillRect(QRectF(ex-3, 0, 3, h), brush)
-
-        if self.grain_map and self.current_loop_ms >= 0:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             
-            for (p_start, p_end, src_start, src_end) in self.grain_map:
-                if p_start <= self.current_loop_ms < p_end:
-                    
-                    # Life cycle of the grain (0.0 to 1.0)
-                    progress = (self.current_loop_ms - p_start) / (p_end - p_start)
-                    
-                    # Calculate position
-                    cur_src = src_start + (src_end - src_start) * progress
-                    gx = (cur_src - self.view_offset) / vw * w
-                    
-                    if 0 <= gx <= w:
-                        hue = (cur_src * 5.0 + self.hue_anim) % 1.0
-                        
-                        # Soft Fade: Sine wave curve for opacity (starts 0, peaks, ends 0)
-                        fade_curve = math.sin(progress * math.pi)
-                        alpha = int(180 * fade_curve) # Max alpha 180
-                        
-                        tri_h = 55  
-                        tri_w = 12   
-                        y_base = h  
-                        
-                        # Use a gradient for the triangle itself (fade out towards top)
-                        t_grad = QLinearGradient(gx, y_base, gx, y_base - tri_h)
-                        col_btm = QColor.fromHslF(hue, 0.6, 0.75, alpha/255.0)
-                        col_top = QColor.fromHslF(hue, 0.6, 0.75, 0.0)
-                        t_grad.setColorAt(0.0, col_btm)
-                        t_grad.setColorAt(1.0, col_top)
-                        
-                        painter.setBrush(QBrush(t_grad))
-                        painter.setPen(Qt.PenStyle.NoPen)
-                        
-                        tri = QPolygonF([
-                            QPointF(gx, y_base - tri_h),
-                            QPointF(gx - tri_w/2, y_base),
-                            QPointF(gx + tri_w/2, y_base)
-                        ])
-                        painter.drawPolygon(tri)
+            painter.fillRect(QRectF(sx, 0, 3, float(h)), brush)
+            painter.fillRect(QRectF(ex-3, 0, 3, float(h)), brush)
 
+        # 4. Main Playhead
         if self.play_head >= 0 and not self.grain_map:
             ph_abs = s + self.play_head * (e - s)
             px = (ph_abs - self.view_offset) / vw * w
-            grad_ph = QLinearGradient(0, 0, 0, h)
-            grad_ph.setColorAt(0.0, QColor(160, 190, 255, 200))
-            grad_ph.setColorAt(1.0, QColor(255, 180, 200, 200))
-            painter.setBrush(QBrush(grad_ph))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(QRectF(px - 1.25, 0, 2.5, h))
+            
+            if px <= ex:
+                grad_ph = QLinearGradient(0, 0, 0, float(h))
+                grad_ph.setColorAt(0.0, QColor(160, 190, 255, 200))
+                grad_ph.setColorAt(1.0, QColor(255, 180, 200, 200))
+                painter.setBrush(QBrush(grad_ph))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRect(QRectF(px - 1.25, 0, 2.5, float(h)))
 
 class ControlRow(QWidget):
     valueChanged = pyqtSignal(float)
@@ -941,7 +1127,7 @@ class MainWindow(QMainWindow):
         self.worker_thread = None      
         self.update_pending = False    
         self.old_threads = []          
-        self.resize(650, 520)
+        self.resize(640, 480)
         self.setAcceptDrops(True)
         self.data, self.sr, self.p_data, self.tf = None, 44100, None, None
         self.is_processing = False
@@ -963,8 +1149,9 @@ class MainWindow(QMainWindow):
         self.vol_anim.setEndValue(0.0)
         self.vol_anim.setEasingCurve(QEasingCurve.Type.Linear)
        
-        self.last_media_pos = 0
+        self.last_media_pos = -1
         self.last_update_time = 0
+        self.smooth_ms = 0.0 # NEW: High-precision accumulator
         
         cw = QWidget()
         self.setCentralWidget(cw)
@@ -1012,14 +1199,26 @@ class MainWindow(QMainWindow):
         
         # --- TOGGLES ROW ---
         t_row = QHBoxLayout()
-        t_row.addStretch()
+        t_row.addStretch() 
+        
         self.btn_clear = PastelPush("clear")
         self.btn_clear.clicked.connect(self.clear_state)
         t_row.addWidget(self.btn_clear)
-        t_row.addSpacing(10)
+        
+        # Reduced gap: 10 -> 4
+        t_row.addSpacing(4)
+        
+        self.btn_play = MorphPlayButton()
+        self.btn_play.clicked.connect(self.toggle_playback)
+        t_row.addWidget(self.btn_play)
+        
+        # Reduced gap: 10 -> 4
+        t_row.addSpacing(4)
         
         self.t_rev = PastelToggle("reverse")
+        self.t_rev.stateChanged.connect(self.auto_prev)
         t_row.addWidget(self.t_rev)
+        
         t_row.addStretch()
         
         mv.addLayout(t_row)
@@ -1150,62 +1349,101 @@ class MainWindow(QMainWindow):
             
             # Restore volume and play
             self.vol_anim.stop()
-            self.ao.setVolume(1.0) # Force volume back to 100%
+            self.ao.setVolume(1.0) 
             
             self.player.setSource(QUrl.fromLocalFile(p))
             self.player.play()
+            self.btn_play.set_state(1) # Set to Playing
             self.atimer.start()
         except Exception as e: 
             print(f"Playback Error: {e}")
 
     def tick(self):
-        if self.p_data is None or len(self.p_data) == 0: return
+        if self.p_data is None or len(self.p_data) == 0: 
+            return
 
         state = self.player.playbackState()
         
         if state == QMediaPlayer.PlaybackState.PlayingState:
-            raw_pos = self.player.position()
             now = time.time()
-            if raw_pos != self.last_media_pos:
-                self.last_media_pos = raw_pos
-                self.last_update_time = now
-                est_pos = raw_pos
-            else:
-                elapsed_ms = (now - self.last_update_time) * 1000.0
-                est_pos = self.last_media_pos + elapsed_ms
-            
             total_dur_ms = (len(self.p_data) / self.sr) * 1000.0
-            if total_dur_ms > 0:
-                current_loop_ms = est_pos % total_dur_ms
-                self.wave.set_playback_pos(current_loop_ms)
+            if total_dur_ms <= 0: return
+
+            if self.last_media_pos == -1:
+                # Initialization
+                raw_pos = self.player.position()
+                self.smooth_ms = float(raw_pos)
+                self.last_update_time = now
+                self.last_media_pos = 0 
+            else:
+                # --- FREEWHEELING CLOCK ---
+                # Rely on system time for smoothness, ignoring audio jitter
+                dt = (now - self.last_update_time) * 1000.0
+                self.last_update_time = now
+                self.smooth_ms += dt
                 
-                # Check grain slider instead of checkbox
-                if self.k_grn.value() > 0.05:
-                    self.wave.set_play_head(-1) 
-                else:
-                    self.wave.set_play_head(current_loop_ms / total_dur_ms)
+                # Handle Loop Wrapping
+                if self.smooth_ms >= total_dur_ms:
+                    self.smooth_ms %= total_dur_ms
+
+                # --- FAILSAFE SYNC ---
+                # Check for massive drift (e.g. Loop Reset or CPU Hang)
+                raw_pos = self.player.position()
+                
+                # Calculate circular distance (shortest path around the loop)
+                dist = raw_pos - self.smooth_ms
+                if dist < -total_dur_ms / 2: dist += total_dur_ms
+                elif dist > total_dur_ms / 2: dist -= total_dur_ms
+                
+                # Only hard snap if we are off by > 300ms (Massive drift)
+                # This prevents micro-stutters from aggressive syncing.
+                if abs(dist) > 300.0:
+                    self.smooth_ms = float(raw_pos)
+
+            # Update UI
+            current_loop_ms = self.smooth_ms
+            self.wave.set_playback_pos(current_loop_ms)
+            
+            if self.k_grn.value() > 0.05:
+                self.wave.set_play_head(-1) 
+            else:
+                self.wave.set_play_head(current_loop_ms / total_dur_ms)
+                
         else:
+            self.last_media_pos = -1
             self.wave.set_play_head(0.0)
             self.wave.set_playback_pos(-1)
 
     def media_status(self, s):
         if s == QMediaPlayer.MediaStatus.EndOfMedia:
-            # Check grain slider instead of checkbox
             if self.k_grn.value() > 0.05:
                 self.player.setPosition(0)
                 self.player.play()
             else:
-                self.wave.set_play_head(-1); self.atimer.stop()
+                self.wave.set_play_head(-1)
+                self.atimer.stop()
+                self.btn_play.set_state(2) # Paused/Ready
 
     def clear_state(self):
         self.player.stop()
+        self.btn_play.set_state(0) # Idle
         self.wave.set_play_head(-1)
         self.atimer.stop()
         self.data, self.p_data = None, None
         self.dsp_cache, self.dsp_hash = None, None
         self.wave.set_data(None)
         self.player.setSource(QUrl())
-
+    
+    def toggle_playback(self):
+        if self.p_data is None: return
+        state = self.player.playbackState()
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.btn_play.set_state(2) # Paused
+        else:
+            self.player.play()
+            self.btn_play.set_state(1) # Playing
+    
     def export(self):
         if self.p_data is None: return
         home_dir = os.path.expanduser("~")
