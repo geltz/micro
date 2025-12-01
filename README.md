@@ -11,6 +11,7 @@ middle/right mouse to pan on waveform.
 
 **buttons**
 - clear
+- play/pause
 - export  
 
 **toggles** 
@@ -29,5 +30,6 @@ middle/right mouse to pan on waveform.
 - grain
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
