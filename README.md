@@ -2,9 +2,7 @@
   <img src="icon.png" alt="micro icon" width="100">
 </p>
 
-micro is a granular sound engine.	
-
-it isolates regions of an audio sample and applies various effects.	
+micro is a granular sampler and effects processor.	
 
 **controls**
 
@@ -31,4 +29,5 @@ middle/right mouse to pan on waveform.
 - grain
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
