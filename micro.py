@@ -321,6 +321,25 @@ class MicroEngine:
             
             final_buffer = seq_buffer
         
+        # 2. SHAKE
+        shake_amt = params.get('shake', 0.0)
+        if shake_amt > 0.01 and final_buffer is not None:
+            ln = len(final_buffer)
+            points = max(5, int(ln / sr * (5 + shake_amt * 15))) 
+            noise_ctrl = np.random.uniform(1.0 - shake_amt, 1.0, points)
+            shake_env = signal.resample(noise_ctrl, ln)
+            if final_buffer.ndim > 1:
+                final_buffer *= shake_env[:, None]
+            else:
+                final_buffer *= shake_env
+
+        # 3. REVERB (applies to main audio only, clicks will be added dry after)
+        v_amt = params.get('verb', 0.0)
+        if v_amt > 0.01:
+            if abort_check and abort_check(): return None, []
+            final_buffer = MicroEngine.apply_reverb(final_buffer, sr, v_amt * 0.6)
+
+        # 4. CLICKS (added after reverb, remain dry - no reverb on clicks)
         click_amt = params.get('clicks', 0.0)
         if click_amt > 0.01 and final_buffer is not None:
             c_bpm = random.randint(90, 150)
@@ -371,24 +390,6 @@ class MicroEngine:
                             
                         last_end_pos = pos + dur_samps
 
-        # 2. SHAKE
-        shake_amt = params.get('shake', 0.0)
-        if shake_amt > 0.01 and final_buffer is not None:
-            ln = len(final_buffer)
-            points = max(5, int(ln / sr * (5 + shake_amt * 15))) 
-            noise_ctrl = np.random.uniform(1.0 - shake_amt, 1.0, points)
-            shake_env = signal.resample(noise_ctrl, ln)
-            if final_buffer.ndim > 1:
-                final_buffer *= shake_env[:, None]
-            else:
-                final_buffer *= shake_env
-
-        # 3. REVERB
-        v_amt = params.get('verb', 0.0)
-        if v_amt > 0.01:
-            if abort_check and abort_check(): return None, []
-            final_buffer = MicroEngine.apply_reverb(final_buffer, sr, v_amt * 0.6)
-        
         return np.clip(final_buffer, -0.99, 0.99), grain_map
 
 class ExportThread(QThread):
@@ -1195,12 +1196,15 @@ class ZoomWaveEditor(QWidget):
             px = (ph_abs - self.view_offset) / vw * w
             
             if px <= ex:
+                # Reduced opacity and thinner width
                 grad_ph = QLinearGradient(0, 0, 0, float(h))
-                grad_ph.setColorAt(0.0, QColor(160, 190, 255, 200))
-                grad_ph.setColorAt(1.0, QColor(255, 180, 200, 200))
+                # Reduced opacity from 200 to 80 (60% reduction)
+                grad_ph.setColorAt(0.0, QColor(160, 190, 255, 80))
+                grad_ph.setColorAt(1.0, QColor(255, 180, 200, 80))
                 painter.setBrush(QBrush(grad_ph))
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawRect(QRectF(px - 1.25, 0, 2.5, float(h)))
+                # Reduced width from 2.5 to 1.5 (40% thinner)
+                painter.drawRect(QRectF(px - 0.75, 0, 1.5, float(h)))
 
 class ControlRow(QWidget):
     valueChanged = pyqtSignal(float)
