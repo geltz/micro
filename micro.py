@@ -111,7 +111,6 @@ class MicroEngine:
         is_granular = grain_val > 0.05
         grain_map = []
         
-        # --- PROCESS SLICE (No Clicks Here) ---
         def process_slice(sub_region):
             raw_start = int(sub_region[0] * len(source_data))
             raw_end = int(sub_region[1] * len(source_data))
@@ -178,150 +177,89 @@ class MicroEngine:
             seq_len = int(total_slots * slot_dur * sr)
             seq_buffer = np.zeros((seq_len, 2), dtype=np.float32)
             
-            # Continuous grain generation - overlapping chain
-            density = int(8 + grain_val * 40)  # Overall density
-            
-            # Start with initial grain
             current_time = 0.0
-            
-            # Track grain timings for crossfade at loop point
             grain_timings = []
-            
-            # Generate grains continuously, not limited by density for the initial pass
-            # We'll generate enough to fill the buffer with overlap
             max_time = total_slots * slot_dur
-            generated_grains = 0
             
             while current_time < max_time:
                 if abort_check and abort_check(): return None, []
                 
-                # Grain duration - ensure continuity by overlapping
-                dur = random.uniform(0.1, 0.25)  # Longer grains for continuity
+                dur = random.uniform(0.1, 0.25)
                 
-                # Position within source region
                 s_pt = region[0] + random.uniform(0, region[1] - region[0] - 0.01)
                 len_norm = dur / (region[1] - region[0]) * 1.5
                 e_pt = min(region[1], s_pt + len_norm)
                 
-                if e_pt - s_pt < 0.001: continue
+                if e_pt - s_pt < 0.001: 
+                    current_time += 0.05
+                    continue
                 
                 grain, s_idx, e_idx = process_slice((s_pt, e_pt))
-                if len(grain) == 0: continue
                 
-                ins_idx = int(current_time * sr)
-                w_len = min(len(grain), seq_len - ins_idx)
-                if w_len > 0:
-                    # Store grain timing for crossfade calculation
-                    grain_timings.append((ins_idx, ins_idx + w_len))
+                if len(grain) > 0:
+                    ins_idx = int(current_time * sr)
+                    w_len = min(len(grain), seq_len - ins_idx)
                     
-                    # Apply smooth envelope - use longer fade for better overlap
-                    env_len = min(w_len * 2, len(grain))
-                    env = np.hanning(env_len)[:w_len]
-                    
-                    # Make envelope more gentle for better overlapping
-                    env = np.power(env, 0.5)  # Even flatter envelope
-                    
-                    if grain.ndim > 1:
-                        grain_slice = grain[:w_len].copy() * env[:, None]
-                    else:
-                        grain_slice = grain[:w_len].copy() * env
-                    
-                    seq_buffer[ins_idx:ins_idx+w_len] += grain_slice * 0.6
-                    
-                    # Add to grain map
-                    p_s = (ins_idx/sr)*1000.0
-                    p_e = ((ins_idx+w_len)/sr)*1000.0
-                    n_s = s_idx/len(source_data)
-                    n_e = (s_idx+w_len)/len(source_data)
-                    grain_map.append((p_s, p_e, n_s, n_e))
-                    
-                    generated_grains += 1
+                    if w_len > 0:
+                        grain_timings.append((ins_idx, ins_idx + w_len))
+                        
+                        env_len = min(w_len * 2, len(grain))
+                        env = np.hanning(env_len)[:w_len]
+                        env = np.power(env, 0.5) 
+                        
+                        if grain.ndim > 1:
+                            grain_slice = grain[:w_len].copy() * env[:, None]
+                        else:
+                            grain_slice = grain[:w_len].copy() * env
+                        
+                        seq_buffer[ins_idx:ins_idx+w_len] += grain_slice * 0.6
+                        
+                        p_s = (ins_idx/sr)*1000.0
+                        p_e = ((ins_idx+w_len)/sr)*1000.0
+                        n_s = s_idx/len(source_data)
+                        n_e = (s_idx+w_len)/len(source_data)
+                        grain_map.append((p_s, p_e, n_s, n_e))
 
-                base_ov = 0.1 + (grain_val * 0.8) 
-                overlap_amount = random.uniform(base_ov, min(0.95, base_ov + 0.1))
-                current_time += dur * (1.0 - overlap_amount)
-            
-            # Create seamless loop by crossfading end to beginning
-            # Find grains that cross the loop boundary
-            loop_crossfade_time = 0.05  # 50ms crossfade at loop point
+                if grain_val < 0.5:
+                    norm = grain_val * 2.0 
+                    stride_factor = 3.5 - (norm * 2.5)
+                else:
+                    norm = (grain_val - 0.5) * 2.0
+                    stride_factor = 1.0 - (norm * 0.9)
+                
+                step = dur * stride_factor * random.uniform(0.9, 1.1)
+                current_time += step
+
+            loop_crossfade_time = 0.05
             crossfade_samples = int(loop_crossfade_time * sr)
             
             if crossfade_samples > 0:
-                # Apply fade in to the beginning
                 fade_in = np.linspace(0, 1, crossfade_samples)
                 if seq_buffer.ndim > 1:
                     seq_buffer[:crossfade_samples] *= fade_in[:, None]
                 else:
                     seq_buffer[:crossfade_samples] *= fade_in
                 
-                # Apply fade out to the end
                 fade_out = np.linspace(1, 0, crossfade_samples)
                 if seq_buffer.ndim > 1:
                     seq_buffer[-crossfade_samples:] *= fade_out[:, None]
                 else:
                     seq_buffer[-crossfade_samples:] *= fade_out
                 
-                # Now crossfade: mix the end of buffer into beginning
-                # Get the audio from the end that will crossfade into beginning
                 end_audio = seq_buffer[-crossfade_samples:].copy()
-                
-                # Apply fade-in to the end audio (so it starts quiet at loop point)
                 if end_audio.ndim > 1:
                     end_audio *= fade_in[:, None]
                 else:
                     end_audio *= fade_in
                 
-                # Mix it with the beginning audio (which already has fade-in applied)
-                seq_buffer[:crossfade_samples] += end_audio * 0.8  # Reduced gain to prevent buildup
+                seq_buffer[:crossfade_samples] += end_audio * 0.8
             
-            # Alternative approach: Ensure grains wrap around seamlessly
-            # Generate additional grains that start before the end and continue past it
-            if generated_grains > 0:
-                # Find the last grain
-                last_grain_end = grain_timings[-1][1] if grain_timings else 0
-                buffer_end_time = seq_len / sr
-                
-                # If there's space at the end, generate a grain that starts near the end
-                # and another that starts at the beginning to overlap
-                if last_grain_end < seq_len:
-                    # Time remaining in buffer
-                    remaining_time = (seq_len - last_grain_end) / sr
-                    
-                    if remaining_time > 0.05:  # If there's significant time remaining
-                        # Generate a grain that starts near the end
-                        start_time = buffer_end_time - random.uniform(0.1, 0.3)
-                        if start_time > 0:
-                            # Generate grain as before
-                            dur = random.uniform(0.1, 0.25)
-                            s_pt = region[0] + random.uniform(0, region[1] - region[0] - 0.01)
-                            len_norm = dur / (region[1] - region[0]) * 1.5
-                            e_pt = min(region[1], s_pt + len_norm)
-                            
-                            if e_pt - s_pt > 0.001:
-                                grain, s_idx, e_idx = process_slice((s_pt, e_pt))
-                                if len(grain) > 0:
-                                    ins_idx = int(start_time * sr)
-                                    w_len = min(len(grain), seq_len - ins_idx)
-                                    if w_len > 0:
-                                        # This grain will get cut off at buffer end
-                                        env = np.hanning(w_len * 2)[:w_len]
-                                        env = np.power(env, 0.5)
-                                        
-                                        if grain.ndim > 1:
-                                            grain_slice = grain[:w_len].copy() * env[:, None]
-                                        else:
-                                            grain_slice = grain[:w_len].copy() * env
-                                        
-                                        seq_buffer[ins_idx:ins_idx+w_len] += grain_slice * 0.6
-            
-            # Final normalization with careful headroom
             pk = np.max(np.abs(seq_buffer))
-            if pk > 0.85:  # More headroom for overlapped grains
+            if pk > 0.85: 
                 seq_buffer *= (0.85/pk)
             
             final_buffer = seq_buffer
         
-        # 2. SHAKE
         shake_amt = params.get('shake', 0.0)
         if shake_amt > 0.01 and final_buffer is not None:
             ln = len(final_buffer)
@@ -333,21 +271,19 @@ class MicroEngine:
             else:
                 final_buffer *= shake_env
 
-        # 3. REVERB (applies to main audio only, clicks will be added dry after)
         v_amt = params.get('verb', 0.0)
         if v_amt > 0.01:
             if abort_check and abort_check(): return None, []
             final_buffer = MicroEngine.apply_reverb(final_buffer, sr, v_amt * 0.6)
 
-        # 4. CLICKS (added after reverb, remain dry - no reverb on clicks)
         click_amt = params.get('clicks', 0.0)
         if click_amt > 0.01 and final_buffer is not None:
             c_bpm = random.randint(90, 150)
-            divs = [0.5, 0.25, 0.125]  # More rhythmic variety
+            divs = [0.5, 0.25, 0.125] 
             step_len = (60.0/c_bpm) * random.choice(divs)
             grid_sz = int(step_len * sr)
             
-            prob = 0.05 + (click_amt * 0.3)  # Lower probability
+            prob = 0.05 + (click_amt * 0.3) 
             last_end_pos = 0
             crush_amt = params.get('crush', 0.0)
             
@@ -358,8 +294,6 @@ class MicroEngine:
                     dur_samps = int((random.uniform(1.0, 4.0) / 1000.0) * sr)
                     
                     if pos + dur_samps < buffer_len:
-                        # --- Lower Tone Chance & Higher Volume ---
-                        # 30% chance for low thud, else high click
                         if random.random() < 0.3:
                             freq = random.uniform(60, 300)
                         else:
@@ -367,13 +301,10 @@ class MicroEngine:
                             
                         t = np.arange(dur_samps) / sr
                         
-                        # Original amplitude - more audible
                         tone_wave = np.sin(2 * np.pi * freq * t)
                         tone_wave += 0.3 * np.sin(2 * np.pi * freq * 2 * t)
                         
                         c_env = np.power(np.linspace(1, 0, dur_samps), 3.0)
-                        
-                        # Louder clicks
                         burst = tone_wave * c_env * (0.15 + click_amt * 0.25)
                         
                         if crush_amt > 0.01: 
