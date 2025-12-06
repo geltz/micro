@@ -1,5 +1,5 @@
 <p>
-  <img src="icon.png" alt="micro icon" width="100">
+  <img src="icon.png" alt="micro icon" width="128">
 </p>
 
 micro is a granular sampler and effects processor.	
@@ -30,6 +30,7 @@ middle/right mouse to pan on waveform.
 - grain
 
 this program is free and [donations are welcome](https://ko-fi.com/geltz)
+
 
 
 
